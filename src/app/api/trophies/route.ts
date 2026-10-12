@@ -12,7 +12,8 @@ import { CONFIG_DIR } from '@/lib/utils/paths';
 export async function GET() {
     const authOptions = await getAuthOptions();
     const session = await getServerSession(authOptions);
-    if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (session.user.role !== 'ADMIN') return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     
     try {
         const trophies = await prisma.trophy.findMany({ orderBy: { targetValue: 'asc' } });
@@ -26,7 +27,8 @@ export async function GET() {
 export async function POST(req: Request) {
     const authOptions = await getAuthOptions();
     const session = await getServerSession(authOptions);
-    if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (session.user.role !== 'ADMIN') return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
     const configDir = CONFIG_DIR;
 
@@ -71,7 +73,8 @@ export async function POST(req: Request) {
 export async function DELETE(req: Request) {
     const authOptions = await getAuthOptions();
     const session = await getServerSession(authOptions);
-    if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (session.user.role !== 'ADMIN') return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     
     try {
         const { searchParams } = new URL(req.url);

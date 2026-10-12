@@ -215,7 +215,10 @@ function SeriesContent() {
       }
   }, [renameModalOpen, folderPattern, filePattern, seriesInfo.id]);
 
+  // Admin-only, like the Rename dialog these patterns pre-fill: the admin settings refuse a regular
+  // user, and that refusal used to read as an expired session and sign them out.
   useEffect(() => {
+      if (!isAdmin) return;
       fetch('/api/admin/config')
           .then(res => res.ok ? res.json() : null)
           .then(data => {
@@ -235,7 +238,7 @@ function SeriesContent() {
               }
           })
           .catch(() => {});
-  }, [seriesInfo.isManga]); // Re-run if the manga status loads/changes
+  }, [isAdmin, seriesInfo.isManga]); // Re-run if the manga status loads/changes
 
   const handleRenameSave = async () => {
       setIsBulkProcessing(true);
