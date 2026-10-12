@@ -26,6 +26,7 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
+import { runBulk } from "@/lib/utils/bulk"
 import { cn } from "@/lib/utils"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import MetadataEditorModal from "@/components/metadata-editor-modal"
@@ -1046,7 +1047,7 @@ function SeriesContent() {
     setIsBulkProcessing(true);
     try {
         const issuesToUpdate = downloadedIssues.filter(i => selectedIssues.has(i.id));
-        const promises = issuesToUpdate.map(issue =>
+        const { succeeded, failed, firstError } = await runBulk(issuesToUpdate, issue =>
             fetch('/api/progress', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1058,18 +1059,24 @@ function SeriesContent() {
             })
         );
 
-        await Promise.all(promises);
-
+        // Only what the server saved changes on screen; the rest stay selected for another try.
+        const updated = new Set(succeeded.map(i => i.id));
         setDownloadedIssues(prev => prev.map(i => {
-            if (selectedIssues.has(i.id)) {
+            if (updated.has(i.id)) {
                 return { ...i, isRead: markAsRead, readProgress: markAsRead ? 100 : 0 };
             }
             return i;
         }));
 
-        toast({ title: "Bulk Update Success", description: `Marked ${selectedIssues.size} issues as ${markAsRead ? 'read' : 'unread'}.` });
-        setSelectedIssues(new Set());
-        setIsSelectionMode(false);
+        const state = markAsRead ? 'read' : 'unread';
+        if (failed.length === 0) {
+            toast({ title: "Bulk Update Success", description: `Marked ${succeeded.length} issue${succeeded.length === 1 ? '' : 's'} as ${state}.` });
+            setSelectedIssues(new Set());
+            setIsSelectionMode(false);
+        } else {
+            toast({ title: `${failed.length} of ${issuesToUpdate.length} issues weren't marked ${state}`, description: firstError ?? undefined, variant: "destructive" });
+            setSelectedIssues(new Set(failed.map(i => i.id)));
+        }
     } catch (e) {
         toast({ title: "Error", description: "Failed to bulk update.", variant: "destructive" });
     } finally {

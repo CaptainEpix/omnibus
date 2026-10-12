@@ -16,6 +16,7 @@ import {
 } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
 import { COMIC_EXT_REGEX } from "@/lib/utils/formats"
+import { runBulk } from "@/lib/utils/bulk"
 import {
   Select,
   SelectContent,
@@ -289,14 +290,21 @@ export default function RequestsPage() {
   const handleBulkCancel = async () => {
       setIsBulkCancelling(true);
       try {
-          const promises = Array.from(selectedRequests).map(id =>
-              fetch(`/api/request?id=${id}`, { method: 'DELETE' })
+          const ids = Array.from(selectedRequests);
+          const { succeeded, failed, firstError } = await runBulk(ids, id =>
+              fetch(`/api/request?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
           );
-          await Promise.all(promises);
-          toast({ title: "Requests Cancelled", description: `Successfully cancelled ${selectedRequests.size} requests.` });
-          setRequests(prev => prev.map(r => selectedRequests.has(r.id) ? { ...r, status: 'CANCELLED' } : r));
-          setSelectedRequests(new Set());
-          setIsSelectionMode(false);
+          // Only what the server accepted changes on screen; refused ones stay as they were, selected.
+          const cancelled = new Set(succeeded);
+          setRequests(prev => prev.map(r => cancelled.has(r.id) ? { ...r, status: 'CANCELLED' } : r));
+          if (failed.length === 0) {
+              toast({ title: "Requests Cancelled", description: `Cancelled ${succeeded.length} request${succeeded.length === 1 ? '' : 's'}.` });
+              setSelectedRequests(new Set());
+              setIsSelectionMode(false);
+          } else {
+              toast({ title: `${failed.length} of ${ids.length} cancellations failed`, description: firstError ?? undefined, variant: "destructive" });
+              setSelectedRequests(new Set(failed));
+          }
       } catch (e) {
           toast({ title: "Error cancelling requests", variant: "destructive" });
       } finally {

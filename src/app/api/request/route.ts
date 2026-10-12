@@ -548,8 +548,12 @@ export async function PATCH(request: NextRequest) {
                     }
                 });
                 if (downloadedIssuesCount === 0 && otherActiveReqs === 0) {
+                    // deleteMany, not delete: a bulk deny of several issues of one series runs these
+                    // PATCHes in parallel, each sees the others already CANCELLED, and each removes
+                    // the skeleton — a second `delete` threw P2025 and answered 500 for a denial
+                    // that had already been saved.
                     await prisma.issue.deleteMany({ where: { seriesId: series.id } });
-                    await prisma.series.delete({ where: { id: series.id } });
+                    await prisma.series.deleteMany({ where: { id: series.id } });
                 }
             }
         }

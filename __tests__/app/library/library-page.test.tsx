@@ -19,14 +19,25 @@ import { act, render, screen } from '@testing-library/react';
 import { ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
+const viewer = vi.hoisted(() => ({ role: 'ADMIN' }));
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next-auth/react', () => ({
-    useSession: () => ({ data: { user: { id: 'admin_1', role: 'ADMIN' } }, status: 'authenticated' }),
+    useSession: () => ({ data: { user: { id: `${viewer.role.toLowerCase()}_1`, role: viewer.role } }, status: 'authenticated' }),
 }));
 vi.mock('next/navigation', () => ({
     useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
     useSearchParams: () => new URLSearchParams(),
 }));
+// The list view is a TableVirtuoso, which renders no rows in jsdom (no viewport to measure). A plain
+// table that renders every row through the page's own itemContent keeps the row markup under test.
+vi.mock('react-virtuoso', async () => {
+    const React = await import('react');
+    return {
+        TableVirtuoso: ({ data, itemContent, context }: any) =>
+            React.createElement('table', null, React.createElement('tbody', null,
+                data.map((item: any, i: number) => React.createElement('tr', { key: item.id ?? i }, itemContent(i, item, context))))),
+    };
+});
 
 import LibraryPage from '@/app/library/page';
 
@@ -57,6 +68,7 @@ let listCalls: string[] = [];
 // slow-but-correct drain — up to 2.8 s measured on a loaded full-suite run vs vitest's 5 s default.
 describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_000 }, () => {
     beforeEach(() => {
+        viewer.role = 'ADMIN';
         listCalls = [];
         toast.mockClear();
         localStorage.clear();
@@ -111,5 +123,41 @@ describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_
         // Series 24 arrived in BOTH windows (the pg tie-order overlap shape); one card, not two.
         expect(screen.getAllByText('Series 24')).toHaveLength(1);
         expect(screen.getAllByText(/^Series \d\d$/)).toHaveLength(26); // 24 + 2 fresh, no dupes
+    });
+});
+
+// Found in the v1.4.7 permission sweep: the list view's Edit Metadata button was the one opener
+// of the series editor without an admin gate (the grid card and the series page had one). A
+// regular user got the editor, its read of the admin settings, and a save the server refuses.
+describe('LibraryPage list view: Edit Metadata is admin-only', { timeout: 15_000 }, () => {
+    beforeEach(() => {
+        localStorage.clear();
+        localStorage.setItem('omnibus-library-view', 'list');
+        vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} } as any);
+        vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} } as any);
+        window.scrollTo = vi.fn() as any;
+        stubFetchRouter([
+            ['/api/library/follow', () => ok({ seriesIds: [] })],
+            ['/api/reading-lists', () => ok([])],
+            ['/api/library?', (u) => new URL(u, 'http://localhost').searchParams.get('namesOnly')
+                ? ok({ names: [] })
+                : ok({ series: [makeSeries(1)], hasMore: false, publishers: ['DC'] })],
+        ]);
+    });
+
+    it('a regular user gets the row actions but no Edit Metadata button', async () => {
+        viewer.role = 'USER';
+        await act(async () => { render(<LibraryPage />); });
+
+        // The row rendered (so the absence below is about the gate, not an empty table).
+        screen.getByLabelText('Add Series 01 to a reading list');
+        expect(screen.queryByLabelText('Edit metadata for Series 01')).toBeNull();
+    });
+
+    it('an admin still gets Edit Metadata on the row', async () => {
+        viewer.role = 'ADMIN';
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByLabelText('Edit metadata for Series 01');
     });
 });
