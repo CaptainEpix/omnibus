@@ -11,6 +11,7 @@ mod annas_archive;
 mod rate_limiter;
 mod metadata_writer;
 mod watched_sync;
+mod naming;
 mod backup;
 mod diagnostics;
 mod manga_detector;
@@ -1034,6 +1035,9 @@ struct BulkRenameRequest {
     /// the built-in default. Configurable because TPB conventions vary far more than annuals do.
     #[serde(default)]
     collected_file_pattern: Option<String>,
+    /// #244: the issue_number_padding setting ("none" / "2" / "3"); absent = 3 digits.
+    #[serde(default)]
+    issue_padding: Option<String>,
 }
 
 /// Bulk rename / standardize, ported from the Node route. Runs SYNCHRONOUSLY (Node calls it via
@@ -1047,7 +1051,8 @@ async fn handle_bulk_rename(
     if req.series_ids.is_empty() || req.folder_pattern.trim().is_empty() || req.file_pattern.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    match renamer::run_bulk_rename(&state.db, &req.series_ids, &req.folder_pattern, &req.file_pattern, req.manga_file_pattern.as_deref(), req.collected_file_pattern.as_deref()).await {
+    let padding = naming::IssuePadding::from_setting(req.issue_padding.as_deref());
+    match renamer::run_bulk_rename(&state.db, &req.series_ids, &req.folder_pattern, &req.file_pattern, req.manga_file_pattern.as_deref(), req.collected_file_pattern.as_deref(), padding).await {
         Ok(summary) => Ok(Json(serde_json::json!({
             "filesRenamed": summary.files_renamed,
             "foldersRenamed": summary.folders_renamed,

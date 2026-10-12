@@ -54,23 +54,3 @@ export function isInsideLibraryRoot(folder: string | null | undefined, roots: st
     return target.startsWith(root + path.sep);
   });
 }
-
-/**
- * Joins an expanded folder pattern onto a library root one segment at a time, dropping blank
- * segments. Null when a segment isn't a plain name ("..", ".", a dots-only run, a drive prefix) or
- * when nothing is left - a series folder is always a folder INSIDE the library. Engine twin:
- * watched_sync.rs library_subfolder.
- */
-export function librarySubfolder(root: string, relFolder: string): string | null {
-  const segments = relFolder.split(/[/\\]/).map((s) => s.trim()).filter(Boolean);
-  if (segments.length === 0) return null;
-  if (segments.some((s) => /^\.+$/.test(s) || /^[a-z]:/i.test(s))) return null;
-  return path.join(root, ...segments);
-}
-
-/** A year as it may appear in a folder name: the digits of a positive integer, else "". */
-export function folderYear(year: unknown): string {
-  if (typeof year !== 'string' && typeof year !== 'number') return '';
-  const n = parseInt(String(year).trim(), 10);
-  return Number.isFinite(n) && n > 0 ? String(n) : '';
-}

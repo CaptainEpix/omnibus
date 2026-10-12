@@ -142,7 +142,7 @@ describe('File System: Importer Engine', () => {
         // FIX: Omnibus COPIES torrent files to preserve seeding!
         expect(fs.copy).toHaveBeenCalledWith(
             expect.any(String),
-            expect.stringContaining('Batman #01.cbz'),
+            expect.stringContaining('Batman #001.cbz'),
             expect.any(Object)
         );
 
@@ -199,7 +199,7 @@ describe('File System: Importer Engine', () => {
             (prisma.issue.findMany as any).mockResolvedValue([issueRow({ filePath: null, status: 'WANTED', fileAddedAt: null })]);
             await Importer.importRequest('req_1');
             const data = (prisma.issue.update as any).mock.calls.at(-1)[0].data;
-            expect(data.filePath).toContain('Batman #01.cbz');
+            expect(data.filePath).toContain('Batman #001.cbz');
             expect(data.fileAddedAt).toBeInstanceOf(Date);
         });
 
@@ -210,8 +210,43 @@ describe('File System: Importer Engine', () => {
             (prisma.issue.findMany as any).mockResolvedValue([issueRow({ filePath: '/library/comics/DC Comics/Batman (2016)/Batman #01.cbr', status: 'DOWNLOADED', fileAddedAt: OLD })]);
             await Importer.importRequest('req_1');
             const data = (prisma.issue.update as any).mock.calls.at(-1)[0].data;
-            expect(data.filePath).toContain('Batman #01.cbz');
+            expect(data.filePath).toContain('Batman #001.cbz');
             expect('fileAddedAt' in data).toBe(false);
+        });
+    });
+
+    // The naming cleanup (#244): a download is named by the same rules as every other path - padded
+    // by the issue_number_padding setting (it used to pad a single digit only), and "$&" in a series
+    // name stays "$&" (string replacement turned it back into the token it replaced).
+    describe('naming (#244)', () => {
+        const download = (series: Record<string, unknown> = {}) => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false, ...series
+            });
+        };
+        const copiedTo = () => String(vi.mocked(fs.copy).mock.calls.at(-1)?.[1]).replace(/\\/g, '/');
+
+        it.each([
+            { padding: 'none', name: 'Batman #1.cbz' },
+            { padding: '2', name: 'Batman #01.cbz' },
+            { padding: '3', name: 'Batman #001.cbz' },
+        ])('pads by the setting ($padding)', async ({ padding, name }) => {
+            mocks.findManySettings.mockResolvedValue([
+                { key: 'download_path', value: '/downloads' },
+                { key: 'issue_number_padding', value: padding },
+            ]);
+            download();
+            expect(await Importer.importRequest('req_1')).toBe(true);
+            expect(copiedTo()).toMatch(new RegExp(`/DC Comics/Batman \\(2016\\)/(\\d+_)?${name.replace(/[.#]/g, '\\$&')}$`));
+        });
+
+        it('keeps "$&" in a series name literal, in the folder and the file', async () => {
+            download({ name: 'Cash $& Carry' });
+            expect(await Importer.importRequest('req_1')).toBe(true);
+            expect(copiedTo()).toMatch(/\/DC Comics\/Cash \$& Carry \(2016\)\/(\d+_)?Cash \$& Carry #001\.cbz$/);
         });
     });
 
@@ -235,7 +270,7 @@ describe('File System: Importer Engine', () => {
             expect(fs.copy).toHaveBeenLastCalledWith(
                 expect.any(String),
                 // (existsSync is true for every path here, so the collision prefix applies)
-                expect.stringMatching(/[\\/]library[\\/]comics[\\/]DC Comics[\\/]Batman \(2016\)[\\/](\d+_)?Batman #01\.cbz$/),
+                expect.stringMatching(/[\\/]library[\\/]comics[\\/]DC Comics[\\/]Batman \(2016\)[\\/](\d+_)?Batman #001\.cbz$/),
                 expect.any(Object)
             );
         });
@@ -278,7 +313,7 @@ describe('File System: Importer Engine', () => {
             await libraryRows([{ number: '37', releaseDate: '2025-12-10' }, { number: '38', releaseDate: '2026-01-14' }]);
 
             expect(await Importer.importRequest('req_1')).toBe(true);
-            expect(copiedTo()).toMatch(/Marvel[\\/]X-Men \(2024\)[\\/](?:\d+_)?X-Men #38 \(2026\)\.cbz$/);
+            expect(copiedTo()).toMatch(/Marvel[\\/]X-Men \(2024\)[\\/](?:\d+_)?X-Men #038 \(2026\)\.cbz$/);
         });
 
         it('the library\'s release date wins over the file\'s own <Year>, so Standardize never renames it again', async () => {
@@ -287,7 +322,7 @@ describe('File System: Importer Engine', () => {
             await libraryRows([{ number: '38', releaseDate: '2025-11-05' }]);
 
             await Importer.importRequest('req_1');
-            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #38 \(2025\)\.cbz$/);
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2025\)\.cbz$/);
         });
 
         it('without a library row, uses the file\'s own ComicInfo <Year>', async () => {
@@ -295,7 +330,7 @@ describe('File System: Importer Engine', () => {
             mocks.parseComicInfo.mockResolvedValueOnce({ series: 'X-Men', number: '38', year: 2024, issueYear: 2026 });
 
             await Importer.importRequest('req_1');
-            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #38 \(2026\)\.cbz$/);
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2026\)\.cbz$/);
         });
 
         it('with neither, falls back to the series year', async () => {
@@ -303,7 +338,7 @@ describe('File System: Importer Engine', () => {
             mocks.parseComicInfo.mockResolvedValueOnce(null);
 
             await Importer.importRequest('req_1');
-            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #38 \(2024\)\.cbz$/);
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2024\)\.cbz$/);
         });
 
         it('an annual takes its year from the annual\'s row, never the main run\'s same number', async () => {
@@ -319,7 +354,7 @@ describe('File System: Importer Engine', () => {
             ]);
 
             await Importer.importRequest('req_1');
-            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men Annual #01 \(2025\)\.cbz$/);
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men Annual #001 \(2025\)\.cbz$/);
         });
     });
 
@@ -343,7 +378,7 @@ describe('File System: Importer Engine', () => {
         expect(result).toBe(true);
         expect(fs.copy).toHaveBeenCalledWith(
             expect.any(String),
-            expect.stringMatching(/Absolute[\\/]DC Comics[\\/]Batman \(2016\)[\\/](?:\d+_)?Absolute Batman #01\.cbz$/),
+            expect.stringMatching(/Absolute[\\/]DC Comics[\\/]Batman \(2016\)[\\/](?:\d+_)?Absolute Batman #001\.cbz$/),
             expect.any(Object),
         );
         expect(mocks.updateSeries).toHaveBeenCalledWith(expect.objectContaining({

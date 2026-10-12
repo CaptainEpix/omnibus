@@ -1,6 +1,7 @@
 // src/app/api/request/manual/route.ts
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
+import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
 import { DownloadService } from '@/lib/download-clients';
@@ -11,8 +12,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { detectManga } from '@/lib/manga-detector';
 import { DiscordNotifier } from '@/lib/discord';
 import { Mailer } from '@/lib/mailer';
-import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
-import { folderYear, librarySubfolder } from '@/lib/utils/paths';
+import { seriesFolderSegments } from '@/lib/utils/naming';
 
 export const dynamic = 'force-dynamic';
 
@@ -76,39 +76,21 @@ export async function POST(request: NextRequest) {
                 : libraries.find(l => l.isDefault && !l.isManga) || libraries.find(l => !l.isManga);
             if (!targetLib) targetLib = libraries[0];
 
-            // --- FIX: Fetch Settings and apply Custom Folder Naming Pattern ---
+            // The name, publisher and year can come straight from the requester (the provider only fills
+            // what's missing). The shared naming rules (naming.ts) sanitize each like ComicInfo metadata - a
+            // dots-only value becomes "_", a year is only ever a plausible year - and refuse a pattern that
+            // would leave the library.
             const settings = await prisma.systemSetting.findMany();
             const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
             const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
-
-            // Name, publisher and year come straight from the requester, so each is sanitized like
-            // ComicInfo metadata: a dots-only value becomes "_" and the year keeps only its digits -
-            // none of them can become a ".." folder segment.
-            const safeFolderName = sanitizeNamingPart(name.replace(/[<>:"/\\|?*]/g, ' - ').replace(/\s+/g, ' ').trim());
-            const safePubFolder = safePublisher !== "Unknown" ? sanitizeNamingPart(safePublisher) : "Other";
-            // A newly created request placeholder has no trusted imprint yet. The first import
-            // fills it from ComicInfo; an existing series keeps its own folderPath.
-            const safeImprint = '';
-
-            let relFolderPath = folderPattern
-                .replace(/{Publisher}/gi, safePubFolder)
-                .replace(/{Series}/gi, safeFolderName)
-                .replace(/{Year}/gi, folderYear(year));
-
-            relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-                .replace(/\(\s*\)/g, '')
-                .replace(/\[\s*\]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-
+            const folderParts = seriesFolderSegments(folderPattern, { publisher, series: name, seriesYear: year, imprint: '' });
             const libraryTypeFolder = isManga ? 'Manga' : 'Comics';
             const basePath = targetLib ? targetLib.path : `/${libraryTypeFolder}`;
-            const seriesFolder = librarySubfolder(basePath, relFolderPath);
-            if (!seriesFolder) {
-                Logger.log(`[Manual Request] Folder pattern "${folderPattern}" gives "${relFolderPath}" for ${name}, which isn't a folder inside the library. Check Settings > Library & Files.`, 'warn');
+            if (!folderParts) {
+                Logger.log(`[Manual Request] Folder pattern "${folderPattern}" gives no folder inside the library for ${name}. Check Settings > Library & Files.`, 'warn');
                 return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Ask an admin to check Settings > Library & Files." }, { status: 400 });
             }
-            const folderPath = seriesFolder.replace(/\\/g, '/');
+            const folderPath = path.join(basePath, ...folderParts).replace(/\\/g, '/');
 
             await prisma.series.upsert({
                 where: { metadataSource_metadataId: { metadataSource: targetMetadataSource, metadataId: cvId.toString() } },

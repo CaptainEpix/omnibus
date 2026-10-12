@@ -10,10 +10,9 @@ import { omnibusQueue } from '@/lib/queue';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { AuditLogger } from '@/lib/audit-logger';
-import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
 import { safeRelocateFolder } from '@/lib/utils/safe-fs';
 import { comicInfoDefaultsUpdateFragment } from '@/lib/utils/comicinfo-fields';
-import { replaceNamingToken } from '@/lib/utils/naming';
+import { seriesFolderSegments } from '@/lib/utils/naming';
 
 export async function POST(request: Request) {
   try {
@@ -64,10 +63,6 @@ export async function POST(request: Request) {
     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
     const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
 
-    const safePublisher = publisher && publisher !== "Unknown" ? sanitize(publisher) : "Other";
-    const safeSeries = sanitize(name || "Unknown Series");
-    const safeYear = year ? year.toString() : "";
-
     // Universe/Series Group aren't edited by the basic modal, so resolve them from the existing
     // series record — otherwise a folder pattern using {UniverseName}/{SeriesGroup} would have
     // those subfolders stripped on a routine name/year/publisher edit. seriesGroup may also be
@@ -76,27 +71,16 @@ export async function POST(request: Request) {
         where: { folderPath: currentPath },
         select: { universe: true, seriesGroup: true, imprint: true }
     });
-    const safeUniverse = existingMetaRow?.universe ? sanitize(existingMetaRow.universe) : "";
     const effectiveSeriesGroup = (seriesGroup !== undefined ? seriesGroup : existingMetaRow?.seriesGroup) || "";
-    const safeSeriesGroup = effectiveSeriesGroup ? sanitize(effectiveSeriesGroup) : "";
     const effectiveImprint = imprint !== undefined ? imprint : existingMetaRow?.imprint;
-    const safeImprint = effectiveImprint ? sanitize(effectiveImprint) : "";
 
-    let relFolderPath = folderPattern
-        .replace(/{Publisher}/gi, safePublisher)
-        .replace(/{Series}/gi, safeSeries)
-        .replace(/{Year}/gi, safeYear)
-        .replace(/{VolumeYear}/gi, safeYear)
-        .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+    const folderParts = seriesFolderSegments(folderPattern, {
+        publisher, series: name, seriesYear: year,
+        universe: existingMetaRow?.universe, seriesGroup: effectiveSeriesGroup, imprint: effectiveImprint,
+    });
+    if (!folderParts) {
+        return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Check Settings > Library & Files." }, { status: 400 });
+    }
     const newPath = path.join(libraryRoot, ...folderParts).replace(/\\/g, '/');
     let activePath = currentPath.replace(/\\/g, '/');
 
@@ -238,7 +222,7 @@ export async function POST(request: Request) {
                 folderPath: activePath, monitored: parsedMonitored, isManga: parsedIsManga, libraryId: targetLib.id,
                 status: status || undefined,
                 bookType: parsedBookType || undefined,
-                ...(imprint !== undefined ? { imprint: imprint || null } : {}),
+                // imprint rides in comicInfoFrag (trimmed; blank clears it).
                 ...comicInfoFrag
             },
             create: {

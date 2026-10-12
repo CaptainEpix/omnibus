@@ -536,7 +536,8 @@ export default function SettingsPage() {
         folder_naming_pattern: "{Publisher}/{Series} ({Year})",
         file_naming_pattern: "{Series} #{Issue}",
         manga_file_naming_pattern: "{Series} Vol. {Issue}",
-        collected_file_naming_pattern: "{Series} Vol. {Issue} ({IssueYear})"
+        collected_file_naming_pattern: "{Series} Vol. {Issue} ({IssueYear})",
+        issue_number_padding: "3"
     }));
     toast({ 
         title: "Defaults Restored", 

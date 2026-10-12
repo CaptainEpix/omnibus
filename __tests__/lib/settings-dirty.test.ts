@@ -40,6 +40,8 @@ describe('lib: settings per-tab dirty tracking', () => {
         expect(computeDirtyTabs(withConfig({ oidc_enabled: 'true' }), withConfig({}))).toEqual(['access']);
         expect(computeDirtyTabs(withConfig({ smtp_host: 'smtp.x' }), withConfig({}))).toEqual(['notifications']);
         expect(computeDirtyTabs(withConfig({ folder_naming_pattern: '{Series}' }), withConfig({}))).toEqual(['library']);
+        expect(computeDirtyTabs(withConfig({ collected_file_naming_pattern: '{Series} v{Issue}' }), withConfig({}))).toEqual(['library']);
+        expect(computeDirtyTabs(withConfig({ issue_number_padding: 'none' }), withConfig({}))).toEqual(['library']);
         expect(computeDirtyTabs(withConfig({ prowlarr_url: 'http://p' }), withConfig({}))).toEqual(['search']);
     });
 

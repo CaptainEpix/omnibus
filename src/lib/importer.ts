@@ -18,8 +18,8 @@ import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
 import { WATCHED_DIR, isInsideLibraryRoot } from '@/lib/utils/paths';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { deleteUsenetSource } from '@/lib/utils/usenet-cleanup';
-import { replaceNamingToken } from '@/lib/utils/naming';
-import { resolveIssueYear } from '@/lib/utils/issue-year';
+import { issueFileName, issuePaddingFromSetting, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
+import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 import { readZipEntryNames } from '@/lib/utils/archive-pages';
 import { requeueWithNextRelease } from '@/lib/requeue';
 
@@ -664,36 +664,31 @@ export const Importer = {
         } catch(e) {}
     }
 
-    const publisherName = (series?.publisher && series.publisher !== "Unknown") ? sanitize(series.publisher) : "Other";
     const seriesYearFromMeta = series?.year || req.activeDownloadName?.match(/\((\d{4})\)/)?.[1] || "";
     const seriesNameFromMeta = series?.name || cleanSeriesName;
-    const safeUniverse = (series as any)?.universe ? sanitize((series as any).universe) : "";
-    // Series Group is not supplied by ComicVine/Metron — the folder uses the value already stored on
-    // the series record (set by a prior scan or a manual edit). A group found only in this file's
-    // ComicInfo.xml is persisted to the series below so subsequent imports/renames pick it up.
-    const safeSeriesGroup = (series as any)?.seriesGroup ? sanitize((series as any).seriesGroup) : "";
     const storedImprint = (series as any)?.imprint?.trim();
     const shouldAdoptImprint = !storedImprint && !(series as any)?.hasCustomMetadata && !!xmlMeta?.imprint;
     const imprintName = storedImprint || (shouldAdoptImprint ? xmlMeta.imprint : "");
-    const safeImprint = imprintName ? sanitize(imprintName) : "";
+    // Series Group is not supplied by ComicVine/Metron — the folder uses the value already stored on
+    // the series record (set by a prior scan or a manual edit). A group found only in this file's
+    // ComicInfo.xml is persisted to the series below so subsequent imports/renames pick it up.
+    const seriesValues: NamingInput = {
+        publisher: series?.publisher,
+        series: seriesNameFromMeta,
+        seriesYear: seriesYearFromMeta,
+        universe: (series as any)?.universe,
+        seriesGroup: (series as any)?.seriesGroup,
+        imprint: imprintName,
+    };
+    const issuePadding = issuePaddingFromSetting(config.issue_number_padding);
 
-    Logger.log(`[Importer Debug] Applying Folder Pattern: "${folderPattern}" | Variables -> Publisher: "${publisherName}", Series: "${seriesNameFromMeta}", Year: "${seriesYearFromMeta}"`, 'debug');
+    Logger.log(`[Importer Debug] Applying Folder Pattern: "${folderPattern}" | Variables -> Publisher: "${series?.publisher || ''}", Series: "${seriesNameFromMeta}", Year: "${seriesYearFromMeta}"`, 'debug');
 
-    let relFolderPath = folderPattern
-        .replace(/{Publisher}/gi, publisherName)
-        .replace(/{Series}/gi, sanitize(seriesNameFromMeta))
-        .replace(/{Year}/gi, seriesYearFromMeta.toString())
-        .replace(/{VolumeYear}/gi, seriesYearFromMeta.toString())
-        .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+    const folderParts = seriesFolderSegments(folderPattern, seriesValues);
+    if (!folderParts) {
+        Logger.log(`[Importer] The folder pattern "${folderPattern}" gives no folder inside the library for ${seriesNameFromMeta}. Check Settings > Library & Files.`, "error");
+        return false;
+    }
     const idealDestFolder = path.join(libraryRoot, ...folderParts);
 
     let destFolder = "";
@@ -735,15 +730,12 @@ export const Importer = {
         destFolder = idealDestFolder;
     }
 
-    Logger.log(`[Importer Debug] Evaluated Folder Pattern: Publisher="${publisherName}", Series="${seriesNameFromMeta}", Year="${seriesYearFromMeta}" -> Result: ${destFolder}`, 'debug');
+    Logger.log(`[Importer Debug] Evaluated Folder Pattern: Series="${seriesNameFromMeta}", Year="${seriesYearFromMeta}" -> Result: ${destFolder}`, 'debug');
 
     const rawFileName = path.basename(actualSourceFile);
     const ext = path.extname(rawFileName);
     const extractedNum = extractIssueNumber(rawFileName);
     Logger.log(`[Importer Debug] Extracted internal issue number as: ${extractedNum} from raw string: ${rawFileName}`, 'debug');
-    
-    let formattedNum = extractedNum;
-    if (!extractedNum.includes('.') && extractedNum.length === 1) formattedNum = `0${extractedNum}`;
     
     // #203 Phase 1: an imported annual lands under the Mylar-shaped name (engine parity:
     // renamer.rs / watched_sync.rs) so it reads correctly beside the main run from the first write.
@@ -762,42 +754,21 @@ export const Importer = {
         }).catch(() => [] as Array<{ number: string; isAnnual: boolean; releaseDate: string | null }>);
         issueReleaseDate = rows.find(r => ((r.isAnnual ?? false) === isAnnualImport) && isSameIssue(r.number, identity))?.releaseDate ?? null;
     }
-    const issueYearFromMeta = resolveIssueYear({
+    const filePatToUse = isAnnualImport ? ANNUAL_FILE_PATTERN : (isManga ? mangaFilePattern : filePattern);
+    const newFileName = issueFileName(filePatToUse, {
+        ...seriesValues,
+        issueNumber: extractedNum,
         releaseDate: issueReleaseDate,
         comicInfoYear: xmlMeta?.issueYear,
-        seriesYear: seriesYearFromMeta,
-    });
-    const filePatToUse = isAnnualImport
-        ? "{Series} Annual #{Issue} ({IssueYear})"
-        : (isManga ? mangaFilePattern : filePattern);
-    
-    const issueTitle = xmlMeta?.title || "";
-    const universeName = xmlMeta?.universe || "";
-    const seriesGroupName = xmlMeta?.seriesGroup || (series as any)?.seriesGroup || "";
+        issueTitle: xmlMeta?.title,
+        universe: xmlMeta?.universe,
+        seriesGroup: xmlMeta?.seriesGroup || (series as any)?.seriesGroup,
+    }, issuePadding) ?? sanitize(path.basename(rawFileName, ext));
 
-    let newFileName = filePatToUse
-        .replace(/{Publisher}/gi, publisherName)
-        .replace(/{Series}/gi, sanitize(seriesNameFromMeta))
-        .replace(/{Year}/gi, seriesYearFromMeta.toString())
-        .replace(/{VolumeYear}/gi, seriesYearFromMeta.toString())
-        .replace(/{IssueYear}/gi, issueYearFromMeta)
-        .replace(/{Issue}/gi, formattedNum)
-        .replace(/{IssueTitle}/gi, sanitize(issueTitle))
-        .replace(/{UniverseName}/gi, sanitize(universeName))
-        .replace(/{SeriesGroup}/gi, sanitize(seriesGroupName));
-
-    newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s*-\s*-/g, ' - ')
-        .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    let fileName = `${sanitize(newFileName)}${ext}`;
+    let fileName = `${newFileName}${ext}`;
     let finalPath = path.join(destFolder, fileName);
     
-    Logger.log(`[Importer Debug] Evaluated File Pattern: Issue="${formattedNum}", IssueYear="${issueYearFromMeta}" -> Result: ${fileName}`, 'debug');
+    Logger.log(`[Importer Debug] Evaluated File Pattern: Issue="${extractedNum}" (padding ${issuePadding}) -> Result: ${fileName}`, 'debug');
     Logger.log(`[Importer Debug] Target move operation: [${actualSourceFile}] -> [${finalPath}]`, 'debug');
 
     try {

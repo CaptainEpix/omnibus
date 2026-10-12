@@ -26,6 +26,7 @@ const TAB_CONFIG_KEYS: Record<string, string[]> = {
     ],
     library: [
         'download_path', 'folder_naming_pattern', 'file_naming_pattern', 'manga_file_naming_pattern',
+        'collected_file_naming_pattern', 'issue_number_padding',
         'cbr_conversion_enabled', 'convert_to_webp', 'webp_quality',
     ],
     search: [

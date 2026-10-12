@@ -159,7 +159,30 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         }));
         expect(res.status).toBe(200);
         expect(mocks.moveFileSafe.mock.calls.map(c => String(c[1]).replace(/\\/g, '/')).at(-1))
-            .toBe('/comics/DC Comics/Batman (2016)/Batman #01.cbz');
+            .toBe('/comics/DC Comics/Batman (2016)/Batman #001.cbz');
+    });
+
+    // The naming cleanup (#244): a matched file is named by the same rules as every other path. The
+    // Smart Matcher used to leave {IssueTitle} in the name as literal text and pad only one digit.
+    it.each([
+        { padding: undefined, expected: 'Batman #001 - The Court of Owls.cbz' },
+        { padding: '2', expected: 'Batman #01 - The Court of Owls.cbz' },
+        { padding: 'none', expected: 'Batman #1 - The Court of Owls.cbz' },
+    ])('names a matched file with its issue title and the padding setting ($padding)', async ({ padding, expected }) => {
+        mocks.findManySettings.mockResolvedValue([
+            { key: 'file_naming_pattern', value: '{Series} #{Issue} - {IssueTitle}' },
+            ...(padding ? [{ key: 'issue_number_padding', value: padding }] : []),
+        ]);
+        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p) === '/unmatched/Batman 001.cbz');
+        vi.mocked(fs.promises.stat).mockResolvedValueOnce({ isFile: () => true } as any);
+        vi.mocked(fs.promises.readdir).mockResolvedValueOnce(['Batman 001.cbz'] as any);
+        const res = await POST(createReq({
+            oldFolderPath: '/unmatched/Batman 001.cbz', metadataId: '1234',
+            name: 'Batman', year: 2016, publisher: 'DC Comics', exactIssueNumber: '1', issueTitle: 'The Court of Owls',
+        }));
+        expect(res.status).toBe(200);
+        expect(mocks.moveFileSafe.mock.calls.map(c => String(c[1]).replace(/\\/g, '/')).at(-1))
+            .toBe(`/comics/DC Comics/Batman (2016)/${expected}`);
     });
 
     it('should query ComicVine by default if metadataSource is not provided', async () => {
@@ -639,7 +662,7 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(res.status).toBe(200);
 
         const renamedTo = mocks.moveFileSafe.mock.calls.map(c => String(c[1]));
-        expect(renamedTo).toContainEqual(expect.stringMatching(/Bone #14 \(1994\)\.cbz$/));
+        expect(renamedTo).toContainEqual(expect.stringMatching(/Bone #014 \(1994\)\.cbz$/));
         expect(renamedTo).not.toContainEqual(expect.stringMatching(/\(1991\)\.cbz$/));
     });
 

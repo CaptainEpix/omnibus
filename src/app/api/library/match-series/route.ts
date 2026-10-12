@@ -26,8 +26,8 @@ import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
 import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
-import { replaceNamingToken } from '@/lib/utils/naming';
-import { resolveIssueYear } from '@/lib/utils/issue-year';
+import { issueFileName, issuePaddingFromSetting, issueTitleForName, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
+import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
 // issue #179), stringified to the Issue JSON-array convention.
@@ -158,13 +158,7 @@ export async function POST(request: Request) {
     if (!realName) realName = path.basename(oldFolderPath).replace(/\s\(\d{4}\)$/, "").trim(); 
     if (!realPublisher) realPublisher = 'Other';
 
-    const safePublisher = sanitizeFilename(realPublisher);
     const safeName = sanitizeFilename(realName);
-    const safeYear = realYear > 0 ? realYear.toString() : '';
-    // {UniverseName}/{SeriesGroup} are admin-supplied (the Smart Matcher metadata editor) — providers
-    // don't reliably expose them. Sanitized here so they can build folder/file paths like every other token.
-    const safeUniverse = universe ? sanitizeFilename(universe) : '';
-    const safeSeriesGroup = seriesGroup ? sanitizeFilename(seriesGroup) : '';
     
     // The records are fetched BEFORE the manga decision — they carry the prior signals.
     let existingRecord = await prisma.series.findUnique({
@@ -187,7 +181,6 @@ export async function POST(request: Request) {
         ? existingRecord.imprint
         : (unmatchedRecord?.imprint ?? existingRecord?.imprint ?? '');
     const effectiveImprint = imprint !== undefined ? imprint : storedImprint;
-    const safeImprint = effectiveImprint ? sanitizeFilename(effectiveImprint) : '';
     // A merge deletes the source row. Retain any imprint adopted from it on the surviving
     // series so subsequent Standardize runs use the same value as this move.
     const adoptedImprint = imprint === undefined && existingRecord && !existingRecord.imprint?.trim()
@@ -219,21 +212,13 @@ export async function POST(request: Request) {
     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
     const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
 
-    let relFolderPath = folderPattern
-        .replace(/{Publisher}/gi, safePublisher || "Other")
-        .replace(/{Series}/gi, safeName || "Unknown Series")
-        .replace(/{Year}/gi, safeYear)
-        .replace(/{VolumeYear}/gi, safeYear)
-        .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+    // {UniverseName}/{SeriesGroup} are admin-supplied (the Smart Matcher metadata editor) — providers
+    // don't reliably expose them.
+    const seriesValues: NamingInput = { publisher: realPublisher, series: realName, seriesYear: realYear, universe, seriesGroup, imprint: effectiveImprint };
+    const folderParts = seriesFolderSegments(folderPattern, seriesValues);
+    if (!folderParts) {
+        return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Check Settings > Library & Files." }, { status: 400 });
+    }
     let newFolderPath = path.join(targetLib.path, ...folderParts).replace(/\\/g, '/');
 
     // Folder collision (field report by robotshavehearts2, "Image does it a lot"): a run and its
@@ -552,54 +537,43 @@ export async function POST(request: Request) {
                 }
                 
                 if (issueNumStr) {
-                    // Issue #200: a raw "½" is length 1 and would pad to "0½" — normalize first so
-                    // filenames and the DB row both say "0.5".
+                    // Issue #200: the DB row says "0.5", never "½".
                     issueNumStr = normalizeFractionNumbers(issueNumStr);
-                    let formattedNum = issueNumStr;
-                    if (!issueNumStr.includes('.') && issueNumStr.length === 1) formattedNum = `0${issueNumStr}`;
-                    
+
                     // #203 Phase 1: an annual keeps the Mylar-shaped name wherever it's named.
                     const filePatternToUse = isAnnualFile
-                        ? "{Series} Annual #{Issue} ({IssueYear})"
+                        ? ANNUAL_FILE_PATTERN
                         : isManga
                             ? (config.manga_file_naming_pattern || "{Series} Vol. {Issue}")
                             : (config.file_naming_pattern || "{Series} #{Issue}");
-                        
+
                     // The series' rows in this file's domain, read before naming: the matched row's
                     // release date is the file's {IssueYear} (#243 - this used the series' year), and
                     // the adopt-or-create below reuses the same rows.
                     // #203: find within the SAME domain — "Annual #1" must never adopt the main run's "#1" row.
-                    let domainRows: Array<{ id: string; number: string; releaseDate: string | null }> = [];
+                    let domainRows: Array<{ id: string; number: string; name: string | null; releaseDate: string | null }> = [];
                     if (existingRecord) {
                         try {
                             domainRows = await prisma.issue.findMany({
                                 where: { seriesId: existingRecord.id, isAnnual: isAnnualFile },
-                                select: { id: true, number: true, releaseDate: true },
+                                select: { id: true, number: true, name: true, releaseDate: true },
                             });
                         } catch (e) {
                             Logger.log(`[Match Series] Could not read the series' issues for ${file}: ${getErrorMessage(e)}`, 'warn');
                         }
                     }
                     const matchedRow = domainRows.find(r => isSameIssue(r.number, issueNumStr)) ?? null;
-                    const issueYear = resolveIssueYear({
+
+                    // Use finalExt so the rename applies the verified extension. The title is the one
+                    // this match sets on the row, else the row's own - what Standardize will name it.
+                    const newFileName = (issueFileName(filePatternToUse, {
+                        ...seriesValues,
+                        seriesYear: existingRecord?.year || realYear,
+                        issueNumber: issueNumStr,
                         releaseDate: matchedRow?.releaseDate,
-                        seriesYear: existingRecord?.year?.toString() || safeYear,
-                    });
+                        issueTitle: issueTitleForName(String(issueTitle ?? '').trim() || matchedRow?.name, realName, issueNumStr),
+                    }, issuePaddingFromSetting(config.issue_number_padding)) ?? path.basename(file, path.extname(file))) + finalExt;
 
-                    // Use finalExt so the rename applies the verified extension
-                    let newFileName = filePatternToUse
-                        .replace(/{Publisher}/gi, safePublisher || "Other")
-                        .replace(/{Series}/gi, safeName)
-                        .replace(/{Year}/gi, safeYear)
-                        .replace(/{VolumeYear}/gi, safeYear)
-                        .replace(/{IssueYear}/gi, issueYear)
-                        .replace(/{Issue}/gi, formattedNum)
-                        .replace(/{UniverseName}/gi, safeUniverse)
-                        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-                    newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-                        .replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim() + finalExt;
-                    
                     const oldFilePath = path.join(activeFolderPath, file);
                     const newFilePath = path.join(activeFolderPath, newFileName);
 
