@@ -25,8 +25,14 @@ export async function GET(request: Request) {
   const authOptions = await getAuthOptions();
   const session = await getServerSession(authOptions);
   
-  if (session?.user?.role !== 'ADMIN') {
+  // Middleware lets this route through unauthenticated (the setup wizard saves here), so the role
+  // check is ours: 401 = no session, 403 = signed in but not an admin (a 401 reads as "your session
+  // ended" to the client's expiry guard).
+  if (!session?.user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (session.user.role !== 'ADMIN') {
+      return NextResponse.json({ error: "Forbidden: Admin privileges required." }, { status: 403 });
   }
 
   // 1. Fetch flat settings and securely obfuscate tokens

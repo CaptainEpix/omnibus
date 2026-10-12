@@ -502,7 +502,8 @@ export async function POST(request: NextRequest) {
 
 export async function PATCH(request: NextRequest) {
   const token = await getToken({ req: request });
-  if (!token || token.role !== 'ADMIN') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (token.role !== 'ADMIN') return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
 
   const userId = (token.id || token.sub) as string;
 

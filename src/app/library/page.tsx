@@ -324,7 +324,10 @@ function LibraryContent() {
       }
   }, [searchParams]);
 
+  // The naming patterns feed the admin-only Standardize tools. Regular users never ask: the admin
+  // settings refuse them, and that refusal used to read as an expired session and sign them out.
   useEffect(() => {
+      if (!isAdmin) return;
       fetch('/api/admin/config')
           .then(res => res.ok ? res.json() : null)
           .then(data => {
@@ -339,7 +342,7 @@ function LibraryContent() {
               }
           })
           .catch(() => {});
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     if (!selectedComic?.cvId) return;
