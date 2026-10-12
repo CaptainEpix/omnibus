@@ -103,7 +103,9 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
               if (!isValid) throw new Error("2FA_INVALID");
           }
           loginAttempts.delete(input);
-          return { id: user.id, name: user.username, email: user.email, role: user.role, autoApproveRequests: user.autoApproveRequests, canDownload: user.canDownload, canCreateGlobalLists: user.canCreateGlobalLists, image: user.avatar, sessionVersion: user.sessionVersion };
+          // Every tier flag, like the SSO path below: the browser's request buttons read canRequest
+          // from the session, and a password sign-in without it showed every Hero "Requests not enabled".
+          return { id: user.id, name: user.username, email: user.email, role: user.role, canRequest: user.canRequest, autoApproveRequests: user.autoApproveRequests, canDownload: user.canDownload, canCreateGlobalLists: user.canCreateGlobalLists, image: user.avatar, sessionVersion: user.sessionVersion };
     }
     })
   ];
@@ -243,7 +245,9 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
             if (session?.user?.image !== undefined) token.picture = session.user.image;
             if (session?.sessionVersion !== undefined) token.sessionVersion = session.sessionVersion;
             token.lastActive = Date.now();
-            token.lastSessionCheck = Date.now();
+            // No lastSessionCheck stamp here: the ping comes at most every 5 minutes on input, so
+            // stamping it starved the sweep below for any active user — revocations and permission
+            // changes never reached them.
         }
         // Deliberately NO lastActive refresh on ambient reads (the SessionProvider's 300s refetch
         // and background polls run this callback constantly and used to keep the window from ever
@@ -259,9 +263,26 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 // expires); only exceptions defer. lastSessionCheck is stamped either way so a
                 // struggling DB gets one probe per 5-minute cycle, not one per session fetch —
                 // which bounds the fail-open window for a revoked session to that same cycle.
+                //
+                // The same read refreshes role + tier flags: an admin applying a tier (or a role) to a
+                // signed-in user changes only the database, and the session used to keep its sign-in
+                // copy until the user signed out. While impersonating, the session is still the admin's
+                // — revocation is judged on the admin's own row, and the target's flags (copied at the
+                // swap below) are left alone.
+                const impersonating = !!(token.isImpersonating && token.originalAdminId);
                 try {
-                    const dbUser = await prisma.user.findUnique({ where: { id: token.id as string }, select: { sessionVersion: true } });
+                    const dbUser = await prisma.user.findUnique({
+                        where: { id: (impersonating ? token.originalAdminId : token.id) as string },
+                        select: { sessionVersion: true, role: true, canRequest: true, autoApproveRequests: true, canDownload: true, canCreateGlobalLists: true },
+                    });
                     if (!dbUser || dbUser.sessionVersion !== (token.sessionVersion || 0)) return { error: "SessionExpired" };
+                    if (!impersonating) {
+                        token.role = dbUser.role;
+                        token.canRequest = dbUser.canRequest;
+                        token.autoApproveRequests = dbUser.autoApproveRequests;
+                        token.canDownload = dbUser.canDownload;
+                        token.canCreateGlobalLists = dbUser.canCreateGlobalLists;
+                    }
                 } catch (e) {
                     Logger.log(`[Auth] sessionVersion check deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
                 }
