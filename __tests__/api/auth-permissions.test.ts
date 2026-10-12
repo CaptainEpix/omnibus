@@ -10,8 +10,8 @@ vi.unmock('@/app/api/auth/[...nextauth]/options');
 // at sign-in: applying a tier to a signed-in user changed the database and nothing else, and the
 // activity ping kept postponing the 5-minute sweep that could have refreshed them.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import crypto from 'crypto';
 import { PERMISSION_TIERS, tierFlags, tierFromUser, type TierFlags } from '@/lib/permission-tiers';
+import { signImpersonationCookie } from '@/lib/impersonation';
 
 const mocks = vi.hoisted(() => {
     process.env.NEXTAUTH_SECRET = 'super_secure_test_secret_key_1234567890';
@@ -154,8 +154,9 @@ describe("Permissions: impersonation is judged on the admin's own session", () =
     const impersonating = (overrides: Record<string, any> = {}) => dueToken({
         id: 'user_2', role: 'USER', sessionVersion: 0, isImpersonating: true, originalAdminId: 'admin_1', ...overrides,
     });
+    // Issued a minute ago, i.e. during this sign-in (the cookie carries its issue time since v1.4.9).
     const signCookie = (target: string, admin: string) =>
-        `${target}|${admin}|${crypto.createHmac('sha256', process.env.NEXTAUTH_SECRET!).update(`${target}|${admin}`).digest('hex')}`;
+        signImpersonationCookie(target, admin, Date.now() - 60_000, process.env.NEXTAUTH_SECRET!);
     const rows: Record<string, any> = {
         admin_1: { sessionVersion: 0, role: 'ADMIN', ...tierFlags('Hero') },
         user_2: { sessionVersion: 3, role: 'USER', ...tierFlags('Sidekick') },  // the target's own version differs

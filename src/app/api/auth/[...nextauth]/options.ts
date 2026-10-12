@@ -5,10 +5,10 @@ import { prisma } from "@/lib/db";
 import bcrypt from "bcryptjs";
 import { cookies } from "next/headers";
 import { decrypt2FA } from "@/lib/encryption";
-import crypto from "crypto";
 import { Logger } from "@/lib/logger";
 import { grantAllLibraries, setUserLibraryAccess, getDefaultLibraryIds } from "@/lib/library-access";
-import { isInactivityExpired } from "@/lib/session-timeout";
+import { isInactivityExpired, windowRole } from "@/lib/session-timeout";
+import { IMPERSONATION_COOKIE, readImpersonationCookie } from "@/lib/impersonation";
 
 // --- SECURITY SAFEGUARD ---
 const defaultSecret = 'change_this_to_a_random_secure_string_123!';
@@ -237,10 +237,13 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
           token.sessionVersion = (user as any).sessionVersion;
           token.lastActive = Date.now();
           token.lastSessionCheck = Date.now();
+          // An impersonation cookie counts only if it was issued after this — signing out and back
+          // in no longer resumes one (the cookie outlives sign-out).
+          token.signedInAt = Date.now();
         }
         // Expiry gate BEFORE the update-trigger slide: a queued activity ping must not revive a
-        // session that already timed out.
-        if (isInactivityExpired(token.role as string, token.lastActive as number)) return { error: "SessionExpired" };
+        // session that already timed out. An impersonating session keeps the admin's window.
+        if (isInactivityExpired(windowRole(token), token.lastActive as number)) return { error: "SessionExpired" };
         if (trigger === "update") {
             if (session?.user?.image !== undefined) token.picture = session.user.image;
             if (session?.sessionVersion !== undefined) token.sessionVersion = session.sessionVersion;
@@ -291,27 +294,14 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
         }
 
         const cookieStore = await cookies();
-        const rawImpersonateCookie = cookieStore.get('omnibus_impersonate')?.value;
-        let impersonateId = null;
-
         if (token.role === "ADMIN" && !token.originalAdminId) token.originalAdminId = token.id;
 
-        if (rawImpersonateCookie && token.originalAdminId) {
-            const parts = rawImpersonateCookie.split('|');
-            if (parts.length === 3) {
-                const [targetId, cookieAdminId, signature] = parts;
-                const secret = process.env.NEXTAUTH_SECRET!;
-                const expectedSignature = crypto.createHmac('sha256', secret).update(`${targetId}|${cookieAdminId}`).digest('hex');
-                
-                const signatureBuffer = Buffer.from(signature);
-                const expectedBuffer = Buffer.from(expectedSignature);
-                if (signatureBuffer.length === expectedBuffer.length && 
-                    crypto.timingSafeEqual(signatureBuffer, expectedBuffer) && 
-                    cookieAdminId === token.originalAdminId) {
-                    impersonateId = targetId;
-                }
-            }
-        }
+        // Genuine, started by this session's admin, issued during this sign-in, inside its hour.
+        const impersonateId = readImpersonationCookie(cookieStore.get(IMPERSONATION_COOKIE)?.value, {
+            secret: process.env.NEXTAUTH_SECRET,
+            adminId: token.originalAdminId,
+            signedInAt: token.signedInAt,
+        });
         // Same fail-open posture as the sessionVersion sweep: a thrown lookup leaves this round's
         // token unchanged (the cookie/token state persists, so the swap or revert simply retries on
         // the next callback run) instead of killing the admin's session.
@@ -320,8 +310,12 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 try {
                     const targetUser = await prisma.user.findUnique({ where: { id: impersonateId } });
                     if (targetUser) {
+                        // Keep the admin's own name/email to restore on the way back (an SSO admin's
+                        // display name isn't their username).
+                        if (!token.isImpersonating) { token.originalAdminName = token.name; token.originalAdminEmail = token.email; }
                         token.id = targetUser.id; token.role = targetUser.role; token.autoApproveRequests = targetUser.autoApproveRequests;
-                        token.canRequest = targetUser.canRequest; token.canDownload = targetUser.canDownload; token.canCreateGlobalLists = targetUser.canCreateGlobalLists; token.picture = targetUser.avatar; token.isImpersonating = true;
+                        token.canRequest = targetUser.canRequest; token.canDownload = targetUser.canDownload; token.canCreateGlobalLists = targetUser.canCreateGlobalLists; token.picture = targetUser.avatar;
+                        token.name = targetUser.username; token.email = targetUser.email; token.isImpersonating = true;
                     }
                 } catch (e) {
                     Logger.log(`[Auth] Impersonation swap deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
@@ -332,7 +326,11 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 const adminUser = await prisma.user.findUnique({ where: { id: token.originalAdminId as string } });
                 if (adminUser) {
                     token.id = adminUser.id; token.role = adminUser.role; token.autoApproveRequests = adminUser.autoApproveRequests;
-                    token.canRequest = adminUser.canRequest; token.canDownload = adminUser.canDownload; token.canCreateGlobalLists = adminUser.canCreateGlobalLists; token.picture = adminUser.avatar; token.isImpersonating = false;
+                    token.canRequest = adminUser.canRequest; token.canDownload = adminUser.canDownload; token.canCreateGlobalLists = adminUser.canCreateGlobalLists; token.picture = adminUser.avatar;
+                    token.name = (token.originalAdminName as string | null | undefined) ?? adminUser.username;
+                    token.email = (token.originalAdminEmail as string | null | undefined) ?? adminUser.email;
+                    delete token.originalAdminName; delete token.originalAdminEmail;
+                    token.isImpersonating = false;
                 }
             } catch (e) {
                 Logger.log(`[Auth] Impersonation revert deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
