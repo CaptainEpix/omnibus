@@ -17,6 +17,12 @@ export const SETTINGS_TABS = [
     { value: 'system', label: 'System' },
 ] as const;
 
+/** The tab a `?tab=<value>` link asks for (the first-run checklist links straight to one), or null. */
+export function requestedSettingsTab(search: string): string | null {
+    const tab = new URLSearchParams(search).get('tab');
+    return tab && SETTINGS_TABS.some(t => t.value === tab) ? tab : null;
+}
+
 const TAB_CONFIG_KEYS: Record<string, string[]> = {
     metadata: [
         'primary_metadata_source', 'cv_api_key', 'metron_api_token', 'metron_user', 'metron_pass', 'series_ended_months',

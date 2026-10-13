@@ -20,7 +20,7 @@ import Link from "next/link"
 import { useSession } from "next-auth/react"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 import { StatusBox, SYSTEM_EVENTS, hosterDisplayNames } from "./tabs/shared"
-import { computeDirtyTabs } from "./tabs/dirty"
+import { computeDirtyTabs, requestedSettingsTab } from "./tabs/dirty"
 import { SettingsTabsList } from "./tabs/tabs-list"
 import { MetadataTab } from "./tabs/metadata-tab"
 import { LibraryFilesTab } from "./tabs/library-files-tab"
@@ -424,6 +424,13 @@ export default function SettingsPage() {
           setNewKeyUserId((session.user as any).id);
       }
   }, [session, users, newKeyUserId]);
+
+  // `?tab=<value>` opens that tab directly - the first-run checklist links to Library & Files,
+  // Metadata and Search & Indexers. Read once on mount (useSearchParams would need a Suspense boundary).
+  useEffect(() => {
+      const tab = requestedSettingsTab(window.location.search);
+      if (tab) setActiveTab(tab);
+  }, []);
 
   const handleTabChange = (val: string) => {
       setActiveTab(val);

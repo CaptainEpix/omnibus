@@ -161,3 +161,42 @@ describe('LibraryPage list view: Edit Metadata is admin-only', { timeout: 15_000
         screen.getByLabelText('Edit metadata for Series 01');
     });
 });
+
+// First-run checklist: an empty Library explains what to do (the checklist's library variant)
+// instead of "No comics found matching your criteria." - which stays for a filter that matches
+// nothing in a library that does have comics.
+describe('LibraryPage empty state', { timeout: 15_000 }, () => {
+    const emptyLibraryWith = (status: unknown) => {
+        stubFetchRouter([
+            ['/api/library/follow', () => ok({ seriesIds: [] })],
+            ['/api/reading-lists', () => ok([])],
+            ['/api/setup-status', () => ok(status)],
+            ['/api/library?', (u) => new URL(u, 'http://localhost').searchParams.get('namesOnly')
+                ? ok({ names: [] })
+                : ok({ series: [], hasMore: false, publishers: [] })],
+        ]);
+    };
+
+    beforeEach(() => {
+        viewer.role = 'USER';
+        localStorage.clear();
+        vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} });
+        vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+        window.scrollTo = vi.fn() as unknown as typeof window.scrollTo;
+    });
+
+    it('tells a reader with an empty library how to get comics', async () => {
+        emptyLibraryWith({ role: 'USER', libraryEmpty: true, canRequest: true });
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByText(/Your library is empty/i);
+        expect(screen.queryByText('No comics found matching your criteria.')).toBeNull();
+    });
+
+    it('keeps the no-match message when the library has comics but the filters match none', async () => {
+        emptyLibraryWith({ role: 'USER', libraryEmpty: false, canRequest: true });
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByText('No comics found matching your criteria.');
+    });
+});

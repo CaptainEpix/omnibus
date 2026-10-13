@@ -32,6 +32,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { InteractiveSearchModal } from "@/components/interactive-search-modal"
 import { FollowBell } from "@/components/follow-bell"
 import MetadataEditorModal from "@/components/metadata-editor-modal"
+import { SetupChecklist } from "@/components/setup-checklist"
 
 interface Comic {
   id: string; // Prisma ID
@@ -1158,9 +1159,19 @@ function LibraryContent() {
       {loading && page === 1 ? (
         <LibrarySkeleton count={pageSize} />
       ) : series.length === 0 ? (
-        <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
-          {activeCollection !== "ALL" ? (<><Layers className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>This reading list is currently empty.</p></>) : (<><Folder className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>No comics found matching your criteria.</p></>)}
-        </div>
+        activeCollection !== "ALL" ? (
+          <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
+            <Layers className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>This reading list is currently empty.</p>
+          </div>
+        ) : (
+          // An empty library says what to do next (the first-run checklist); a filter that matches
+          // nothing in a library that has comics keeps the plain message.
+          <SetupChecklist variant="library" fallback={
+            <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
+              <Folder className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>No comics found matching your criteria.</p>
+            </div>
+          } />
+        )
       ) : viewMode === 'grid' ? (
         // v1.4.2: plain CSS grid again — the virtualized grid (VirtuosoGrid + useWindowScroll,
         // in place since beta.063) fought the browser's scroll anchoring at the infinite-scroll
