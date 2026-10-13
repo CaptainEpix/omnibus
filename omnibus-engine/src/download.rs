@@ -611,46 +611,16 @@ async fn attempt_stream_inner(
     )?;
     let total = plan.expected_total.unwrap_or(0);
 
-    // Stream to the .part file. The 45s stall-watchdog is a per-chunk timeout: no data for 45s aborts
-    // (Node reset a setTimeout on every 'data' event). Progress is throttled to every 5% / >2s.
     let mut file = if plan.append {
         tokio::fs::OpenOptions::new().append(true).open(part_path).await?
     } else {
         tokio::fs::File::create(part_path).await?
     };
     let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = plan.already_have;
-    let mut last_pct: i64 = -1;
-    let mut last_update = std::time::Instant::now();
-    let mut first_update = true;
-
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(STALL_SECS), stream.next()).await {
-            Err(_) => {
-                log::error!("[Internal DL] Data stream stalled for {} seconds. Aborting to trigger retry.", STALL_SECS);
-                bail!("Download stalled for {} seconds", STALL_SECS);
-            }
-            Ok(None) => break, // stream finished
-            Ok(Some(Err(e))) => {
-                bail!("Stream error: {}", e);
-            }
-            Ok(Some(Ok(chunk))) => {
-                file.write_all(&chunk).await?;
-                downloaded += chunk.len() as u64;
-                if total > 0 {
-                    let pct = ((downloaded as f64 / total as f64) * 100.0) as i64;
-                    if pct % 5 == 0 && pct != last_pct && (first_update || last_update.elapsed().as_millis() > 2000) {
-                        first_update = false;
-                        last_pct = pct;
-                        last_update = std::time::Instant::now();
-                        let _ = sqlx::query(r#"UPDATE "Request" SET progress = $1 WHERE id = $2"#)
-                            .bind(pct as i32).bind(&req.request_id).execute(db).await;
-                    }
-                }
-            }
-        }
-    }
-    file.flush().await?;
+    let downloaded = pump_body(
+        db, &req.request_id, &mut stream, &mut file,
+        plan.already_have, total, std::time::Duration::from_secs(STALL_SECS),
+    ).await?;
     drop(file);
 
     // #240: a clean end of stream is not proof of a whole file - compare with what was announced.
@@ -684,6 +654,86 @@ async fn attempt_stream_inner(
     }
 
     Ok(())
+}
+
+/// Streams the body into the .part file and returns the byte count, including the `already_have`
+/// bytes a resume appends to. The stall-watchdog is a per-chunk timeout: no data for `stall` aborts
+/// (Node reset a setTimeout on every 'data' event). Progress is throttled to every 5% / >2s.
+///
+/// Whatever ends it - the stream's end, a stream error or a stall - every byte written is flushed
+/// before this returns. tokio's File finishes a write in the background, and the retry measures the
+/// .part file to decide where to resume: with the last chunk still in flight it resumed a few hundred
+/// bytes early and appended them twice.
+async fn pump_body<S, C, E, W>(
+    db: &sqlx::AnyPool,
+    request_id: &str,
+    stream: &mut S,
+    file: &mut W,
+    already_have: u64,
+    total: u64,
+    stall: std::time::Duration,
+) -> Result<u64>
+where
+    S: futures_util::Stream<Item = std::result::Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    E: std::fmt::Display,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let pumped = pump_chunks(db, request_id, stream, file, already_have, total, stall).await;
+    let flushed = file.flush().await;
+    let downloaded = pumped?;
+    flushed?;
+    Ok(downloaded)
+}
+
+async fn pump_chunks<S, C, E, W>(
+    db: &sqlx::AnyPool,
+    request_id: &str,
+    stream: &mut S,
+    file: &mut W,
+    already_have: u64,
+    total: u64,
+    stall: std::time::Duration,
+) -> Result<u64>
+where
+    S: futures_util::Stream<Item = std::result::Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    E: std::fmt::Display,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut downloaded: u64 = already_have;
+    let mut last_pct: i64 = -1;
+    let mut last_update = std::time::Instant::now();
+    let mut first_update = true;
+
+    loop {
+        match tokio::time::timeout(stall, stream.next()).await {
+            Err(_) => {
+                log::error!("[Internal DL] Data stream stalled for {} seconds. Aborting to trigger retry.", stall.as_secs());
+                bail!("Download stalled for {} seconds", stall.as_secs());
+            }
+            Ok(None) => break, // stream finished
+            Ok(Some(Err(e))) => {
+                bail!("Stream error: {}", e);
+            }
+            Ok(Some(Ok(chunk))) => {
+                let chunk = chunk.as_ref();
+                file.write_all(chunk).await?;
+                downloaded += chunk.len() as u64;
+                if total > 0 {
+                    let pct = ((downloaded as f64 / total as f64) * 100.0) as i64;
+                    if pct % 5 == 0 && pct != last_pct && (first_update || last_update.elapsed().as_millis() > 2000) {
+                        first_update = false;
+                        last_pct = pct;
+                        last_update = std::time::Instant::now();
+                        let _ = sqlx::query(r#"UPDATE "Request" SET progress = $1 WHERE id = $2"#)
+                            .bind(pct as i32).bind(request_id).execute(db).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(downloaded)
 }
 
 #[cfg(test)]
@@ -918,6 +968,94 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert!(seen[1].contains(&format!("range: bytes={}-", half)), "attempt 2 resumed: {}", seen[1]);
         assert!(!seen[2].contains("range:"), "attempt 3 restarted from zero: {}", seen[2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==== The bytes written so far are on disk whenever pump_body returns. tokio's File accepts a
+    // write at once and finishes it in the background, so a pump that bailed without a flush left
+    // its last chunk in flight; the retry then measured a short .part file, asked for a Range resume
+    // a few hundred bytes early, and appended those bytes twice. (CI caught it once, as a resume
+    // from 8091 instead of the 8379 bytes that arrived.)
+
+    /// A writer that lands each write the way tokio::fs::File does: accepted at once, on disk only
+    /// when the next write starts or the file is flushed.
+    struct DeferredWriter {
+        landed: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        in_flight: Vec<u8>,
+    }
+
+    impl DeferredWriter {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+            let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self { landed: landed.clone(), in_flight: Vec::new() }, landed)
+        }
+        fn land(&mut self) {
+            let done = std::mem::take(&mut self.in_flight);
+            self.landed.lock().unwrap().extend_from_slice(&done);
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DeferredWriter {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            self.land();
+            self.in_flight = buf.to_vec();
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            self.land();
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    async fn pump_db() -> (std::path::PathBuf, crate::db::Db) {
+        let (dir, db, _req, _part) = dl_fixture("http://127.0.0.1:9/pump").await;
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_leaves_every_byte_that_arrived_on_disk() {
+        let (dir, db) = pump_db().await;
+        let (mut file, landed) = DeferredWriter::new();
+        let mut stream = futures_util::stream::iter(vec![
+            Ok::<Vec<u8>, &str>(vec![1u8; 300]),
+            Ok(vec![2u8; 288]),
+            Err("connection closed before message completed"),
+        ]);
+
+        let err = pump_body(&db.pool, "req_1", &mut stream, &mut file, 0, 0, std::time::Duration::from_secs(5)).await.unwrap_err();
+
+        assert!(err.to_string().contains("Stream error"), "{err}");
+        assert_eq!(landed.lock().unwrap().len(), 588, "the last chunk is on disk before the retry measures the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stall_leaves_every_byte_that_arrived_on_disk() {
+        let (dir, db) = pump_db().await;
+        let (mut file, landed) = DeferredWriter::new();
+        let mut stream = futures_util::stream::iter(vec![Ok::<Vec<u8>, &str>(vec![1u8; 300]), Ok(vec![2u8; 288])])
+            .chain(futures_util::stream::pending());
+
+        let err = pump_body(&db.pool, "req_1", &mut stream, &mut file, 0, 0, std::time::Duration::from_millis(50)).await.unwrap_err();
+
+        assert!(err.to_string().contains("stalled"), "{err}");
+        assert_eq!(landed.lock().unwrap().len(), 588, "the last chunk is on disk before the retry measures the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_is_all_on_disk_and_counts_the_banked_bytes() {
+        let (dir, db) = pump_db().await;
+        let (mut file, landed) = DeferredWriter::new();
+        let mut stream = futures_util::stream::iter(vec![Ok::<Vec<u8>, &str>(vec![1u8; 300]), Ok(vec![2u8; 288])]);
+
+        let downloaded = pump_body(&db.pool, "req_1", &mut stream, &mut file, 1000, 0, std::time::Duration::from_secs(5)).await.unwrap();
+
+        assert_eq!(downloaded, 1588, "a resume counts the bytes it appends to");
+        assert_eq!(landed.lock().unwrap().len(), 588);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
