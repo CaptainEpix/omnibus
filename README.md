@@ -90,6 +90,7 @@ The last several releases added a lot. The biggest things to be aware of:
 ## Table of Contents
 - [Recent Highlights](#recent-highlights-october-2026)
 - [Installation (Docker)](#installation-docker)
+- [First Steps](#first-steps)
 - [Features & Navigation](#features--navigation)
   - [Authentication & Security](#authentication--security)
   - [Homepage](#homepage)
@@ -326,7 +327,7 @@ On the **Paths** step (*Storage Mappings*), enter folders the way the containers
 | Download Scan Root | `/data/downloads` |
 | Library Folders → Path | `/data/comics` |
 
-When you're done, the **System Health** card on the Admin page checks your setup — the engine connection, your ComicVine key, and whether the download folder is writable.
+When you're done, the **System Health** card on the Admin page checks your setup — the engine connection, your ComicVine key, and whether the download folder is writable. Then head to [First Steps](#first-steps).
 
 ### Behind a reverse proxy or Cloudflare Tunnel?
 
@@ -336,6 +337,52 @@ Manual comic uploads are large requests, and proxies commonly cap request bodies
 - **nginx / Nginx Proxy Manager:** `client_max_body_size` defaults to just **1MB**. Add `client_max_body_size 2048m;` (NPM: Edit Proxy Host → Advanced) so single-request uploads and other large calls aren't rejected with HTTP 413.
 
 Omnibus' own upload limit is 2GB per file, adjustable with the `OMNIBUS_MAX_UPLOAD_MB` environment variable on the web container.
+
+---
+
+## First Steps
+
+Omnibus keeps your comic library organised, lets you read it, and can download new comics for you. You can only read comics that are **in your library**: the covers on the Home page are suggestions from ComicVine that you can request, not comics you have yet.
+
+### Read the comics you already have
+
+1. Copy a few comics (`.cbz`, `.cbr`, `.cb7`, `.zip`, `.rar`, `.epub`) into `data/comics/`, one folder per series — for example `data/comics/DC Comics/Absolute Batman (2024)/`.
+2. Open **Library** and press **Refresh**. Omnibus scans the folder and adds each series with its covers and details. A series it can't identify on its own is waiting for you in **Admin Dashboard → Smart Matcher**.
+3. Open a series and press **Read**. Your place is saved as you read.
+
+Library still empty? Check **Admin → Settings → Library & Files → Root Library Folders**: it should list `/data/comics`.
+
+To read on a phone or tablet instead, see [External Readers & OPDS Support](#external-readers--opds-support).
+
+### Get new comics
+
+1. On **Home**, search for a series. **Request Issue** gets one issue; **Request Series** (shown as **Request Missing** once you own part of the series) gets every issue you don't have, and offers to monitor the series so new issues are fetched as they come out. A series page has a **Monitor Series** button too.
+2. Follow it in **My Requests**. A request from a user who isn't allowed to auto-approve waits for an admin first.
+3. When the download finishes, Omnibus moves it into your library and it shows up in **Library**.
+
+Omnibus searches GetComics out of the box. Prowlarr, download clients (qBittorrent, SABnzbd, …) and FlareSolverr are optional and live in **Admin → Settings**.
+
+### Where your files go
+
+With the folder layout from [step 1](#step-1--make-the-folders):
+
+| What | Folder on your server |
+| --- | --- |
+| Your library, filed as `Publisher/Series (Year)/` | `data/comics/` |
+| Direct downloads while they arrive | `data/downloads/GetComics/` |
+| Torrent and usenet downloads | wherever your download client saves them (see below) |
+| Packs being split into single issues | `data/watched/` |
+| Files Omnibus couldn't identify — match them in **Smart Matcher** | `data/unmatched/` |
+
+### A download reached 100% but never shows up in Library?
+
+The download finished, but Omnibus couldn't move it into your library. Open **Admin → Logs** and look for lines starting with `[Importer]` from around the time it finished:
+
+* **"No Library Path found for this import"** — no library folder is set. Add `/data/comics` under **Admin → Settings → Library & Files → Root Library Folders**.
+* **"Permission denied"** — Omnibus isn't allowed to write to the folder. On Linux the web container runs as user ID 1000: `sudo chown -R 1000:1000 data`.
+* **"Source file not found … Check Path Mappings!"** (torrent / usenet) — your download client saved the file somewhere Omnibus can't see. Mount the downloads folder at the same path in both containers, or map it with the client's **Settings** button under **Admin → Settings → Downloads**.
+
+The **System Health** card on the Admin Dashboard checks the first two for you.
 
 ---
 
