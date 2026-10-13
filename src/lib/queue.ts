@@ -13,6 +13,7 @@ import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { isSameIssue, extractIssueNumber } from '@/lib/utils/issue-parser';
 import { processPageSweepChunk } from '@/lib/pages/page-sweep';
 import { SCHEDULE_SEED_KEY, newScheduleSeed, scheduleOffsetMs } from '@/lib/schedule-jitter';
+import { SCHEDULE_KEYS, scheduleValue } from '@/lib/schedule-defaults';
 
 function isNewerVersion(latest: string, current: string): boolean {
     const cleanLatest = latest.replace(/^v/, '');
@@ -98,20 +99,14 @@ const NO_RETRY_SCHEDULED_JOBS = new Set([
 
 export async function syncSchedules() {
     const settings = await prisma.systemSetting.findMany({
-        where: {
-            key: {
-                in: [
-                    'library_sync_schedule', 'metadata_sync_schedule', 'monitor_sync_schedule',
-                    'diagnostics_sync_schedule', 'backup_sync_schedule', 'backup_sync_day', 'popular_sync_schedule',
-                    'weekly_digest_schedule', 'weekly_digest_day', 'cbr_conversion_schedule', 'embed_metadata_schedule',
-                    'series_json_schedule', 'cache_cleanup_schedule', 'watched_sync_schedule', 'health_check_schedule',
-                    'unmatched_sweep_schedule'
-                ]
-            }
-        }
+        where: { key: { in: [...SCHEDULE_KEYS, 'cbr_conversion_enabled'] } }
     });
-    
-    const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    // A schedule nobody saved runs on the default Admin → Jobs shows for it (schedule-defaults.ts) -
+    // a fresh install saves none, and used to run none of these jobs until someone pressed Save there.
+    const saved: Record<string, string> = Object.fromEntries(settings.map(s => [s.key, s.value]));
+    const config: Record<string, string> = { ...saved };
+    for (const key of SCHEDULE_KEYS) config[key] = scheduleValue(saved, key);
 
     // #216: a legacy `repeat: { every }` lands on multiples of the interval since the Unix epoch, so every
     // install fired its daily jobs at 00:00 UTC together - a nightly burst against Metron. Schedules now
@@ -185,17 +180,18 @@ export async function syncSchedules() {
     // --------------------------------
     
     // cbr_conversion_enabled=false: no scheduled conversion sweep (native RAR reading serves CBRs);
-    // the manual "Run Now" trigger keeps working regardless.
+    // the manual "Run Now" trigger keeps working regardless. (The setting is loaded above now - it
+    // wasn't, so turning Auto-Convert off never stopped the scheduled sweep.)
     await addJob('CBR_CONVERSION', config.cbr_conversion_enabled === 'false' ? '0' : config.cbr_conversion_schedule);
     await addJob('EMBED_METADATA', config.embed_metadata_schedule);
     await addJob('EXPORT_SERIES_JSON', config.series_json_schedule);
     await addJob('CACHE_CLEANUP', config.cache_cleanup_schedule);
 
     // --- REPLACED: Converted hardcoded 15m intervals to dynamic user variables ---
-    await addJob('WATCHED_FOLDER_SYNC', config.watched_sync_schedule || '0.25'); 
+    await addJob('WATCHED_FOLDER_SYNC', config.watched_sync_schedule);
     // Unmatched-series retry sweep (discussion #177): budget-aware; default hourly.
-    await addJob('UNMATCHED_SWEEP', config.unmatched_sweep_schedule || '1');
-    await addJob('SYSTEM_HEALTH_CHECK', config.health_check_schedule || '0.25'); 
+    await addJob('UNMATCHED_SWEEP', config.unmatched_sweep_schedule);
+    await addJob('SYSTEM_HEALTH_CHECK', config.health_check_schedule);
 
     // Leave the GitHub update checker at 24 hours
     await addJob('UPDATE_CHECK', '24');

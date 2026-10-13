@@ -17,6 +17,7 @@ import {
     Sparkles
 } from "lucide-react"
 import { getErrorMessage } from "@/lib/utils/error"
+import { SCHEDULE_DEFAULTS } from "@/lib/schedule-defaults"
 
 const INTERVALS = [
     { label: "Disabled (Manual Only)", value: "0" },
@@ -34,28 +35,30 @@ const INTERVALS = [
 
 export default function ScheduledJobsPage() {
   const router = useRouter()
-  const [metadataSyncSchedule, setMetadataSyncSchedule] = useState("24")
-  const [embedMetadataSchedule, setEmbedMetadataSchedule] = useState("0")
-  const [seriesJsonSchedule, setSeriesJsonSchedule] = useState("0")
+  // A schedule nobody saved shows its shared default - the same value the scheduler runs on.
+  const D = SCHEDULE_DEFAULTS
+  const [metadataSyncSchedule, setMetadataSyncSchedule] = useState<string>(D.metadata_sync_schedule)
+  const [embedMetadataSchedule, setEmbedMetadataSchedule] = useState<string>(D.embed_metadata_schedule)
+  const [seriesJsonSchedule, setSeriesJsonSchedule] = useState<string>(D.series_json_schedule)
   // Feature toggles are READ-ONLY here (Phase 3, one owner per setting): the series.json export
   // lives in Settings → Metadata and CBR auto-conversion in Settings → Library & Files. This page
   // only reflects their state so a scheduled job that would skip is explained, never flips them.
   const [seriesJsonEnabled, setSeriesJsonEnabled] = useState(true) // default ON (discussion #182)
   const [cbrConversionEnabled, setCbrConversionEnabled] = useState(true) // default ON
-  const [librarySyncSchedule, setLibrarySyncSchedule] = useState("12") 
-  const [monitorSyncSchedule, setMonitorSyncSchedule] = useState("24") 
-  const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState("168")
-  const [backupSyncSchedule, setBackupSyncSchedule] = useState("168")
-  const [backupSyncDay, setBackupSyncDay] = useState("1")
-  const [cacheCleanupSchedule, setCacheCleanupSchedule] = useState("24") 
-  const [popularSyncSchedule, setPopularSyncSchedule] = useState("24")
-  const [converterSyncSchedule, setConverterSyncSchedule] = useState("24")
-  const [weeklyDigestSchedule, setWeeklyDigestSchedule] = useState("168")
-  const [weeklyDigestDay, setWeeklyDigestDay] = useState("1") 
-  
+  const [librarySyncSchedule, setLibrarySyncSchedule] = useState<string>(D.library_sync_schedule)
+  const [monitorSyncSchedule, setMonitorSyncSchedule] = useState<string>(D.monitor_sync_schedule)
+  const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState<string>(D.diagnostics_sync_schedule)
+  const [backupSyncSchedule, setBackupSyncSchedule] = useState<string>(D.backup_sync_schedule)
+  const [backupSyncDay, setBackupSyncDay] = useState<string>(D.backup_sync_day)
+  const [cacheCleanupSchedule, setCacheCleanupSchedule] = useState<string>(D.cache_cleanup_schedule)
+  const [popularSyncSchedule, setPopularSyncSchedule] = useState<string>(D.popular_sync_schedule)
+  const [converterSyncSchedule, setConverterSyncSchedule] = useState<string>(D.cbr_conversion_schedule)
+  const [weeklyDigestSchedule, setWeeklyDigestSchedule] = useState<string>(D.weekly_digest_schedule)
+  const [weeklyDigestDay, setWeeklyDigestDay] = useState<string>(D.weekly_digest_day)
+
   // --- ADDED: State for new jobs ---
-  const [watchedSyncSchedule, setWatchedSyncSchedule] = useState("0.25")
-  const [healthCheckSchedule, setHealthCheckSchedule] = useState("0.25")
+  const [watchedSyncSchedule, setWatchedSyncSchedule] = useState<string>(D.watched_sync_schedule)
+  const [healthCheckSchedule, setHealthCheckSchedule] = useState<string>(D.health_check_schedule)
   
   const [savingJobs, setSavingJobs] = useState(false)
   const [runningJob, setRunningJob] = useState<string | null>(null) 
