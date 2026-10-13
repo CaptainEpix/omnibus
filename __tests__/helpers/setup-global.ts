@@ -14,6 +14,8 @@ import { vi } from 'vitest';
 const spies = vi.hoisted(() => ({
     loggerLog: vi.fn(),
     loggerSetLevel: vi.fn(),
+    // Code that only does extra work for debug logging asks the level first; info by default.
+    loggerGetLevel: vi.fn().mockReturnValue('info'),
     // Routes chain .catch() onto these — a bare vi.fn() returning undefined would throw.
     auditLog: vi.fn().mockResolvedValue(true),
     notifierSendAlert: vi.fn().mockResolvedValue(true),
@@ -23,7 +25,7 @@ const spies = vi.hoisted(() => ({
     revalidateTag: vi.fn(),
 }));
 
-vi.mock('@/lib/logger', () => ({ Logger: { log: spies.loggerLog, setLevel: spies.loggerSetLevel } }));
+vi.mock('@/lib/logger', () => ({ Logger: { log: spies.loggerLog, setLevel: spies.loggerSetLevel, getLevel: spies.loggerGetLevel } }));
 vi.mock('@/lib/audit-logger', () => ({ AuditLogger: { log: spies.auditLog } }));
 vi.mock('@/lib/notifications', () => ({ SystemNotifier: { sendAlert: spies.notifierSendAlert } }));
 vi.mock('@/lib/discord', () => ({
@@ -35,6 +37,7 @@ vi.mock('next/cache', () => ({ revalidatePath: spies.revalidatePath, revalidateT
 
 export const loggerLog = spies.loggerLog;
 export const loggerSetLevel = spies.loggerSetLevel;
+export const loggerGetLevel = spies.loggerGetLevel;
 export const auditLog = spies.auditLog;
 export const notifierSendAlert = spies.notifierSendAlert;
 export const discordSendAlert = spies.discordSendAlert;
