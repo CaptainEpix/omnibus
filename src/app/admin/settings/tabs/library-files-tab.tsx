@@ -75,7 +75,8 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                                 </div>
                                 <div className="space-y-1.5">
                                     <Label className="text-base sm:text-lg font-bold text-primary">Root Path</Label>
-                                    <Input value={lib.path} onChange={e => updateLibrary(lib.id, 'path', e.target.value)} placeholder={typeof window !== 'undefined' && navigator.platform.indexOf('Win') > -1 ? "C:\\Comics\\Library" : "/library"} className="h-12 sm:h-10 font-mono bg-background border-border text-foreground text-sm" />
+                                    <Input value={lib.path} onChange={e => updateLibrary(lib.id, 'path', e.target.value)} placeholder="/data/comics" className="h-12 sm:h-10 font-mono bg-background border-border text-foreground text-sm" />
+                                    <p className="text-[11px] text-muted-foreground">The folder as Omnibus sees it. In Docker, use the container side of a volume in your compose file (e.g. /data/comics), not a Windows path like C:\Comics.</p>
                                 </div>
                                 <Button variant="ghost" size="icon" className="absolute top-2 right-2 h-10 w-10 sm:h-8 sm:w-8 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 transition-opacity opacity-100 sm:opacity-0 group-hover:opacity-100" onClick={() => removeLibrary(lib.id)}>
                                     <Trash2 className="w-5 h-5 sm:h-4 sm:w-4" />
@@ -93,10 +94,10 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                         <Input 
                             value={config.download_path} 
                             onChange={e => setConfig({...config, download_path: e.target.value})} 
-                            placeholder={typeof window !== 'undefined' && navigator.platform.indexOf('Win') > -1 ? "C:\\Downloads\\Comics" : "/downloads"} 
+                            placeholder="/data/downloads"
                             className="h-12 sm:h-10 font-mono bg-muted/30 border-border text-foreground"
                         />
-                        <p className="text-[11px] text-muted-foreground">The folder Omnibus scans for finished downloads before routing them into your libraries.</p>
+                        <p className="text-[11px] text-muted-foreground">The folder Omnibus scans for finished downloads before routing them into your libraries - like the library folders, the path as Omnibus sees it inside its container.</p>
                     </div>
 
                     <div className="border-t border-border my-4" />

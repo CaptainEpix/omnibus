@@ -3,7 +3,7 @@ import { prisma } from '@/lib/db';
 import fs from 'fs-extra';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
-import { CACHE_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/lib/utils/paths';
+import { CACHE_DIR, WATCHED_DIR, UNMATCHED_DIR, serverPathProblem } from '@/lib/utils/paths';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { findDuplicateGroups } from '@/lib/duplicate-detector';
 import { SystemNotifier } from '@/lib/notifications';
@@ -173,7 +173,14 @@ export async function runSystemHealthCheck() {
 
     let libsAccessible = true;
     for (const lib of libraries) {
-        if (!fs.existsSync(lib.path)) {
+        // Before the existence probe: a relative path (a Windows `C:\Comics` inside the Linux container)
+        // resolves under the app's working directory, so "inaccessible" - or worse, "exists" - hides
+        // that the PATH itself is wrong (Discord field report, 2026-10-13).
+        const pathProblem = serverPathProblem(lib.path);
+        if (pathProblem) {
+            results.push({ id: `lib_acc_${lib.id}`, name: `Library Access: ${lib.name}`, status: 'error', message: `Root Path: ${pathProblem}`, actionLink: '/admin/settings' });
+            libsAccessible = false;
+        } else if (!fs.existsSync(lib.path)) {
             Logger.log(`[Health Check Debug] Library path inaccessible: ${lib.path}`, 'debug');
             results.push({ id: `lib_acc_${lib.id}`, name: `Library Access: ${lib.name}`, status: 'error', message: `Path ${lib.path} is inaccessible.` });
             libsAccessible = false;

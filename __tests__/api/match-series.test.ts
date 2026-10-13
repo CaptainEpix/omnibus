@@ -4,6 +4,7 @@ import { POST } from '@/app/api/library/match-series/route';
 import fs from 'fs';
 import axios from 'axios';
 import { makePostJson } from '../helpers/request';
+import { pinPlatform } from '../helpers/platform';
 import { Logger } from '@/lib/logger';
 
 // 1. Hoist the mocks
@@ -227,6 +228,28 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(res.status).toBe(403);
         const data = await res.json();
         expect(data.error).toBe('Unauthorized path access');
+    });
+
+    // Discord field report (2026-10-13, Docker Desktop on Windows): a library saved as `C:\Comics`
+    // before saves were checked failed every match with "EACCES: permission denied, mkdir 'C:'".
+    // The match now says which library is wrong and how to fix it - before touching anything.
+    it('refuses to match into a library whose Root Path the server cannot use, saying why', async () => {
+        const restore = pinPlatform('linux');
+        try {
+            mocks.findManyLibraries.mockResolvedValue([{ id: 'lib_1', name: 'Comics', path: 'C:\\Comics', isDefault: true }]);
+            const res = await POST(createReq({ oldFolderPath: '/unmatched/Batman', metadataId: '1234', name: 'Batman', year: 2016, publisher: 'DC Comics' }));
+
+            expect(res.status).toBe(400);
+            const { error } = await res.json();
+            expect(error).toContain('Root Path of library "Comics": "C:\\Comics" is a Windows path');
+            expect(error).toContain('Settings > Library & Files');
+            expect(mocks.safeRelocateFolder).not.toHaveBeenCalled();
+            expect(mocks.moveFileSafe).not.toHaveBeenCalled();
+            expect(mocks.createSeries).not.toHaveBeenCalled();
+            expect(mocks.updateSeries).not.toHaveBeenCalled();
+        } finally {
+            restore();
+        }
     });
 
     it('should substitute admin-supplied {SeriesGroup}/{UniverseName} into the folder and persist + lock them', async () => {

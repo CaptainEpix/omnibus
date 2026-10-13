@@ -495,7 +495,9 @@ export default function SetupWizard() {
               toast({ title: "Setup Complete!", description: "Welcome to Omnibus." });
               router.push('/login'); 
           } else {
-              toast({ title: "Save Failed", variant: "destructive" });
+              // The server says why (e.g. a library path it can't use - fixed back on Storage).
+              const errData = await res.json().catch(() => null);
+              toast({ title: "Save Failed", description: errData?.error, variant: "destructive" });
           }
       } catch (e) {
           toast({ title: "Error", variant: "destructive" });
@@ -876,6 +878,7 @@ export default function SetupWizard() {
 
                         <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
                             <Label className="uppercase text-xs text-muted-foreground tracking-widest font-bold mb-3 block">Library Folders</Label>
+                            <p className="text-[10px] text-muted-foreground -mt-2 mb-3">Enter each folder as Omnibus sees it. In Docker, use the container side of a volume in your compose file (e.g. /data/comics), not a Windows path like C:\Comics.</p>
                             <div className="space-y-3">
                                 {libraries.map((lib, i) => (
                                     <div key={lib.id} className="p-4 border rounded-lg bg-slate-50 dark:bg-slate-950/50 relative">

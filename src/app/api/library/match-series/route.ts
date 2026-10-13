@@ -17,7 +17,7 @@ import { omnibusQueue } from '@/lib/queue';
 import { describeIssueFromFilename, normalizeFractionNumbers, isSameIssue } from '@/lib/utils/issue-parser';
 import { COMIC_EXTENSIONS } from '@/lib/utils/formats';
 import { sanitizeFilename } from '@/lib/utils/sanitize';
-import { UNMATCHED_DIR, CONFIG_DIR, isPathWithinRoots } from '@/lib/utils/paths';
+import { UNMATCHED_DIR, CONFIG_DIR, isPathWithinRoots, serverPathProblem } from '@/lib/utils/paths';
 import { safeRelocateFolder, moveFileSafe, ensureLibraryDir } from '@/lib/utils/safe-fs';
 import { comicInfoDefaultsUpdateFragment } from '@/lib/utils/comicinfo-fields';
 import { countArchivePages } from '@/lib/utils/archive-pages';
@@ -207,6 +207,12 @@ export async function POST(request: Request) {
 
     if (!targetLib) targetLib = libraries[0];
     if (!targetLib) return NextResponse.json({ error: "No libraries configured." }, { status: 400 });
+    // A Root Path saved before saves were checked (e.g. `C:\Comics` under Docker) would fail below as a
+    // bare "EACCES: permission denied, mkdir 'C:'" - name the library and the fix instead.
+    const rootProblem = serverPathProblem(targetLib.path);
+    if (rootProblem) {
+        return NextResponse.json({ error: `Root Path of library "${targetLib.name}": ${rootProblem} Change it in Settings > Library & Files.` }, { status: 400 });
+    }
 
     const settings = await prisma.systemSetting.findMany();
     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));

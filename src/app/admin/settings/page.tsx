@@ -489,9 +489,13 @@ export default function SettingsPage() {
             }
         } else {
             const errData = await res.json().catch(() => ({} as any));
+            // A 400 is the server turning the save away before writing anything (a folder path it
+            // can't use, Force SSO without a local admin password) - nothing to reload for.
             toast({
                 title: "Save Failed",
-                description: `${errData?.error || `The server answered HTTP ${res.status}.`} Some changes may still have been applied — reload the page to see what persisted.`,
+                description: res.status === 400 && errData?.error
+                    ? errData.error
+                    : `${errData?.error || `The server answered HTTP ${res.status}.`} Some changes may still have been applied — reload the page to see what persisted.`,
                 variant: "destructive"
             });
         }

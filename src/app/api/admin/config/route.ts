@@ -7,7 +7,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { syncSchedules } from '@/lib/queue';
-import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/lib/utils/paths';
+import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR, serverPathProblem } from '@/lib/utils/paths';
 import { encryptSecret, decryptSecret } from '@/lib/encryption';
 import { SECRET_SETTING_KEYS } from '@/lib/secret-keys';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
@@ -147,6 +147,33 @@ export async function POST(request: Request) {
                 error: "Cannot enable Force SSO: No Admin account with a local password exists. Please set a local password for an Admin account first to prevent lockouts." 
             }, { status: 400 });
         }
+    }
+
+    // Folders Omnibus itself writes to must be paths the SERVER can use - inside Docker, the container
+    // side of a volume. A Windows path saved here (Docker Desktop users type `C:\Comics`) resolved under
+    // the app's working directory and failed every match with "mkdir 'C:'" (Discord field report,
+    // 2026-10-13). Checked before anything is written; a download client's Remote Path is the CLIENT's
+    // view, so it stays free-form.
+    const pathProblems: string[] = [];
+    if (Array.isArray(libraries)) {
+        for (const lib of libraries) {
+            const problem = serverPathProblem(lib?.path);
+            if (problem) pathProblems.push(`Root Path of library "${lib?.name || 'Unnamed'}": ${problem}`);
+        }
+    }
+    if (typeof settings?.download_path === 'string' && settings.download_path.trim()) {
+        const problem = serverPathProblem(settings.download_path, { example: '/data/downloads' });
+        if (problem) pathProblems.push(`Download Scan Root: ${problem}`);
+    }
+    if (Array.isArray(downloadClients)) {
+        for (const client of downloadClients) {
+            if (typeof client?.localPath !== 'string' || !client.localPath.trim()) continue;
+            const problem = serverPathProblem(client.localPath, { example: '/data/downloads' });
+            if (problem) pathProblems.push(`Local Path of download client "${client.name || 'Unnamed'}": ${problem}`);
+        }
+    }
+    if (pathProblems.length > 0) {
+        return NextResponse.json({ error: pathProblems.join(' ') }, { status: 400 });
     }
 
     // Encrypt credential fields at rest before persisting. '********' means "unchanged" (the GET
