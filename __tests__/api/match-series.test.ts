@@ -5,6 +5,7 @@ import fs from 'fs';
 import axios from 'axios';
 import { makePostJson } from '../helpers/request';
 import { pinPlatform } from '../helpers/platform';
+import { notifierSendAlert } from '../helpers/setup-global';
 import { Logger } from '@/lib/logger';
 
 // 1. Hoist the mocks
@@ -821,7 +822,11 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         // The route's request query, honoured rather than ignored: a status the route does not ask
         // for is never returned, so dropping NEEDS_REVIEW from that list fails these tests (which is
         // exactly the defect a match used to leave behind).
-        const requestsHeld = (rows: { id: string; status: string; issueNumber: string; activeDownloadName: string }[]) =>
+        type HeldRequest = {
+            id: string; status: string; issueNumber: string; activeDownloadName: string;
+            userId?: string; imageUrl?: string; user?: { username: string; email: string | null };
+        };
+        const requestsHeld = (rows: HeldRequest[]) =>
             mocks.findManyRequests.mockImplementation(async (args: { where?: { status?: { in?: string[] } } }) =>
                 rows.filter(r => !args?.where?.status?.in || args.where.status.in.includes(r.status))
             );
@@ -877,6 +882,74 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
             expect(res.status).toBe(200);
 
             expect(mocks.updateManyRequests).not.toHaveBeenCalled();
+            expect(notifierSendAlert).not.toHaveBeenCalled();
+        });
+
+        // A request the match completes used to ring only the in-app bell: Discord, email, Pushover,
+        // Telegram and Apprise heard nothing, while the importer alerts for every request it completes.
+        // One "available" alert per requester per match - a match often completes several at once.
+        describe('the "available" alert', () => {
+            const nicolas = { userId: 'u_nicolas', user: { username: 'nicolas', email: 'n@example.test' } };
+            const adam = { userId: 'u_adam', user: { username: 'adam', email: 'a@example.test' } };
+            const onDisk = (...numbers: string[]) =>
+                onDiskIssues(numbers.map(n => ({ number: n, filePath: `/comics/DC Comics/Batman (2016)/Batman #0${n}.cbz` })));
+
+            it('tells the requester their issue is in the library', async () => {
+                requestsHeld([{ id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #31-40 (2016)', imageUrl: 'http://cover/37.jpg', ...nicolas }]);
+                onDisk('37');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(1);
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({
+                    title: 'Batman #37',
+                    user: 'nicolas',
+                    email: 'n@example.test',
+                    imageUrl: 'http://cover/37.jpg',
+                    description: expect.stringContaining('Smart Matcher'),
+                }));
+            });
+
+            it('sends one alert for several issues of the same requester, listing them', async () => {
+                requestsHeld([
+                    { id: 'req_38', status: 'PENDING', issueNumber: '38', activeDownloadName: 'Batman #38', ...nicolas },
+                    { id: 'req_36', status: 'NEEDS_REVIEW', issueNumber: '36', activeDownloadName: 'Batman #31-40 (2016)', ...nicolas },
+                    { id: 'req_37', status: 'MANUAL_DDL', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas },
+                ]);
+                onDisk('36', '37', '38');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(1);
+                const [, payload] = notifierSendAlert.mock.calls[0] as [string, { title: string; description: string; email: string }];
+                expect(payload.title).toBe('Batman - 3 Issues Available!');
+                expect(payload.description).toContain('#36, #37, #38');
+                expect(payload.email).toBe('n@example.test');
+            });
+
+            it('tells each requester about their own issues', async () => {
+                requestsHeld([
+                    { id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas },
+                    { id: 'req_38', status: 'PENDING', issueNumber: '38', activeDownloadName: 'Batman #38', ...adam },
+                ]);
+                onDisk('37', '38');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(2);
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({ title: 'Batman #37', user: 'nicolas', email: 'n@example.test' }));
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({ title: 'Batman #38', user: 'adam', email: 'a@example.test' }));
+            });
+
+            it('never fails the match when an alert can\'t be sent', async () => {
+                notifierSendAlert.mockRejectedValueOnce(new Error('Discord webhook 500'));
+                requestsHeld([{ id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas }]);
+                onDisk('37');
+
+                expect((await POST(matchReq())).status).toBe(200);
+                await new Promise(r => setTimeout(r, 0)); // let the detached rejection reach its catch
+                expect(mocks.updateManyRequests).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['req_37'] } } }));
+            });
         });
     });
 });

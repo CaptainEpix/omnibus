@@ -6,7 +6,8 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import { detectManga } from '@/lib/manga-detector';
-import { DiscordNotifier } from '@/lib/discord'; 
+import { DiscordNotifier } from '@/lib/discord';
+import { SystemNotifier } from '@/lib/notifications';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger'; 
 import { MetronProvider } from '@/lib/metadata/providers/metron';
@@ -74,6 +75,52 @@ async function fetchIssueCreditsForImport(provider: string, issueMetaId: string)
     } catch (e) {
         Logger.log(`[Match Series] Issue-credit fetch failed for ${provider} ${issueMetaId}: ${getErrorMessage(e)} — the title will be written unlocked.`, 'warn');
         return null;
+    }
+}
+
+type MatchedRequest = {
+    id: string;
+    userId: string;
+    imageUrl: string | null;
+    user?: { username: string | null; email: string | null } | null;
+};
+
+/**
+ * The "available" alert for the requests a match just completed - Discord, email, Pushover, Telegram,
+ * Apprise - which used to hear nothing while the importer alerts for every request it completes. One
+ * alert per requester (a match often completes several at once). Unlike the importer, it doesn't wait
+ * for the requester's other requests in the volume to finish: a match is a deliberate admin action,
+ * and one stuck request would hold the alert forever. Never awaited, so an unreachable webhook or
+ * mail server can't fail or slow the match.
+ */
+function announceMatchedRequests(
+    closed: MatchedRequest[],
+    issueNumbers: Map<string, string>,
+    series: { name: string; publisher?: string | null; year?: number | null },
+): void {
+    const byUser = new Map<string, MatchedRequest[]>();
+    for (const req of closed) byUser.set(req.userId, [...(byUser.get(req.userId) ?? []), req]);
+
+    for (const reqs of byUser.values()) {
+        const issues = [...new Set(reqs.map(r => issueNumbers.get(r.id) ?? ''))]
+            .filter(Boolean)
+            .sort((a, b) => (parseFloat(a) - parseFloat(b)) || a.localeCompare(b));
+        if (issues.length === 0) continue;
+        const first = reqs[0];
+        const one = issues.length === 1;
+
+        SystemNotifier.sendAlert('comic_available', {
+            title: one ? `${series.name} #${issues[0]}` : `${series.name} - ${issues.length} Issues Available!`,
+            imageUrl: first.imageUrl,
+            user: first.user?.username,
+            email: first.user?.email,
+            description: one
+                ? `Matched in the Smart Matcher - #${issues[0]} is in your library and ready to read.`
+                : `Matched in the Smart Matcher - #${issues.join(', #')} are in your library and ready to read.`,
+            publisher: series.publisher || undefined,
+            year: series.year ? String(series.year) : undefined,
+            date: new Date().toLocaleString(),
+        }).catch((e: unknown) => Logger.log(`[Match Series] Couldn't send the "available" alert to ${first.user?.username || 'the requester'}: ${getErrorMessage(e)}`, 'warn'));
     }
 }
 
@@ -757,19 +804,24 @@ export async function POST(request: Request) {
         // here read "#37" out of a pack title like "X-Men #34-40" as 34 and never matched the issue
         // the request was actually for.
         const pendingRequests = await prisma.request.findMany({
-            where: { volumeId: targetMetaId, status: { in: ['MANUAL_DDL', 'PENDING', 'DOWNLOADING', 'NEEDS_REVIEW'] } }
+            where: { volumeId: targetMetaId, status: { in: ['MANUAL_DDL', 'PENDING', 'DOWNLOADING', 'NEEDS_REVIEW'] } },
+            include: { user: { select: { username: true, email: true } } }
         });
 
         if (pendingRequests.length > 0) {
             const seriesIssues = await prisma.issue.findMany({ where: { series: { metadataId: targetMetaId } } });
-            const requestsToComplete = [];
+            const requestsToComplete: typeof pendingRequests = [];
+            const issueNumbers = new Map<string, string>();
 
             for (const dbReq of pendingRequests) {
                 const issueNumber = issueNumberOf(dbReq);
                 if (!issueNumber) continue;
                 const matchingIssue = seriesIssues.find(i => isSameIssue(i.number, issueNumber) && i.filePath && i.filePath.length > 0);
 
-                if (matchingIssue) requestsToComplete.push(dbReq.id);
+                if (matchingIssue) {
+                    requestsToComplete.push(dbReq);
+                    issueNumbers.set(dbReq.id, issueNumber);
+                }
             }
 
             if (requestsToComplete.length > 0) {
@@ -779,8 +831,13 @@ export async function POST(request: Request) {
                 // already cleared (notified: true) used to close silently; a NEEDS_REVIEW row was
                 // never announced at all.
                 await prisma.request.updateMany({
-                    where: { id: { in: requestsToComplete } },
+                    where: { id: { in: requestsToComplete.map(r => r.id) } },
                     data: { status: 'COMPLETED', progress: 100, notified: false }
+                });
+                announceMatchedRequests(requestsToComplete, issueNumbers, {
+                    name: existingRecord?.name || realName,
+                    publisher: existingRecord?.publisher,
+                    year: existingRecord?.year || realYear,
                 });
             }
         }
