@@ -107,6 +107,7 @@ The last several releases added a lot. The biggest things to be aware of:
   - [Custom Release Scoring & Formats](#custom-release-scoring--formats)
   - [Settings & Administration](#settings--administration)
   - [Additional Screenshots](#additional-screenshots)
+- [Metadata Sources, Licenses & Covers](#metadata-sources-licenses--covers)
 - [Acknowledgements](#acknowledgements)
 - [Contributors](#contributors)
 
@@ -127,7 +128,7 @@ The database is a single SQLite file in your config folder, so there is no datab
 ### Before you start
 
 * **Docker with Docker Compose** on the machine that will run Omnibus. Docker Desktop (Windows/macOS) includes Compose; on Linux, follow [Docker's install guide](https://docs.docker.com/engine/install/) and check that `docker compose version` works.
-* **A free ComicVine API key** — Omnibus' default source for covers, synopses, and issue lists. Create an account at [comicvine.gamespot.com](https://comicvine.gamespot.com/), then open [comicvine.gamespot.com/api](https://comicvine.gamespot.com/api/) to see your key. ([Metron.Cloud](https://metron.cloud/) is an optional second source.)
+* **A free ComicVine API key** — Omnibus' default source for covers, synopses, and issue lists. Create an account at [comicvine.gamespot.com](https://comicvine.gamespot.com/), then open [comicvine.gamespot.com/api](https://comicvine.gamespot.com/api/) to see your key. ([Metron.Cloud](https://metron.cloud/) is an optional second source.) Both have their own terms of use; see [Metadata Sources, Licenses & Covers](#metadata-sources-licenses--covers).
 * **Optional — add them whenever you like:** Prowlarr (indexer search), a download client (qBittorrent, SABnzbd, …), FlareSolverr. You don't need any of them to organize and read the comics you already have.
 
 ### Step 1 — Make the folders
@@ -783,6 +784,28 @@ Settings are organized into **8 task-focused tabs** — Metadata, Library & File
 
 ---
 
+## Metadata Sources, Licenses & Covers
+
+Omnibus gets its metadata from two providers, each with its own terms. You use your own ComicVine key and your own Metron account, so their terms apply to you as their user.
+
+**ComicVine**
+* ComicVine's API is free for **non-commercial use only**; commercial use can get a key revoked.
+* ComicVine asks apps to link back to it on any page that uses its data. Omnibus does this in the footer of every page.
+* Its API page also asks apps not to edit its data or reproduce it on another medium. Omnibus lets you edit metadata and writes it into your own comic files (`ComicInfo.xml`) for your library; if you share files or data beyond your own use, read [ComicVine's terms](https://comicvine.gamespot.com/api/) first.
+
+**Metron**
+* Use your own Metron account with an API token (create one on [metron.cloud](https://metron.cloud/) under your profile; Metron is retiring password sign-in for its API). Never share one account between installs, and don't create extra accounts to get around the limits.
+* Each account gets 20 requests a minute and 5,000 a day. Omnibus paces itself by Metron's own rate-limit headers, so a big sync just takes longer.
+* **Need a higher limit?** A donation to Metron through [Open Collective](https://opencollective.com/metron) raises the daily limit of the account it's matched to, up to 25,000 requests a day. Use the email address confirmed on your Metron account, and don't contribute as Incognito, so the donation can be matched to it.
+* Metron's data is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), and Omnibus credits it in the footer of every page. Omnibus also writes metadata into your comic files (`ComicInfo.xml`, `series.json`): keeping them in your own library is fine, but if you share them publicly, the Metron data in them falls under the same license (credit Metron and share it under CC BY-SA 4.0).
+
+**Covers**
+* Cover images belong to their publishers and creators. Neither ComicVine's terms nor Metron's license covers them, and Metron's fair-use basis for hosting them doesn't extend to other apps. Omnibus downloads covers to show them in your library; whether that's allowed where you live is your call.
+
+Metron's [Using Metron in Commercial Software](https://metron-project.github.io/blog/commercial-api-use) post has the details.
+
+---
+
 ## Acknowledgements
 
 Omnibus stands on the shoulders of giants. This project was heavily inspired by and built with immense respect for the developers of the following incredible self-hosted applications:
@@ -793,7 +816,7 @@ Omnibus stands on the shoulders of giants. This project was heavily inspired by 
 * **[Mylar3](https://github.com/mylar3/mylar3):** The absolute titan of comic tracking and downloading that paved the way.
 * **[ReadMeABook](https://github.com/kikootwo/ReadMeABook):** For the beautiful UI/UX inspiration and demonstrating what a modern web reader can look like.
 * **[ComicVine](https://comicvine.gamespot.com/):** For providing the API and metadata backbone that keeps our digital collections accurate and beautiful.
-* **[Metron](https://metron.cloud/):** For providing another source of metadata that has allowed for additional features (Release Calendar).
+* **[Metron](https://metron.cloud/):** For providing another source of metadata that has allowed for additional features (Release Calendar). Metron's data is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
 ---
 
