@@ -30,6 +30,8 @@ const mocks = vi.hoisted(() => ({
     // The ZIP index reader (end record + central directory only) - readable by default.
     readZipEntryNames: vi.fn().mockResolvedValue(['01.jpg']),
     requeue: vi.fn().mockResolvedValue('requeued'),
+    // The saved-folder check (its own real-fs tests live in stored-folder.test.ts) - fine by default.
+    storedFolderProblem: vi.fn().mockReturnValue(null),
 }));
 
 // 2. Deeply Mock Dependencies to save RAM and prevent OOM crashes
@@ -80,6 +82,7 @@ vi.mock('@/lib/utils/archive-pages', async (importOriginal) => ({
     readZipEntryNames: mocks.readZipEntryNames,
 }));
 vi.mock('@/lib/requeue', () => ({ requeueWithNextRelease: mocks.requeue }));
+vi.mock('@/lib/utils/stored-folder', () => ({ storedFolderProblem: mocks.storedFolderProblem }));
 
 describe('File System: Importer Engine', () => {
     beforeEach(() => {
@@ -103,6 +106,38 @@ describe('File System: Importer Engine', () => {
         mocks.zipGetEntries.mockReturnValue([]);
         mocks.getAllActiveDownloads.mockResolvedValue([]);
         mocks.findFirstClient.mockResolvedValue(null);
+        mocks.storedFolderProblem.mockReset();
+        mocks.storedFolderProblem.mockReturnValue(null);
+    });
+
+    // beta.018 follow-up: a Root Path saved before Settings checked it (a Windows path under Docker,
+    // a leading space, a folder nothing is mounted at) surfaced only as a bare EACCES deep in the
+    // copy. The importer now names the library and the fix, and touches nothing.
+    it('refuses a library whose saved Root Path the server can\'t use, naming the library and the fix', async () => {
+        mocks.findUniqueRequest.mockResolvedValueOnce({
+            id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+        });
+        mocks.findFirstSeries.mockResolvedValueOnce({
+            id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false
+        });
+        mocks.findManyLibraries.mockResolvedValue([
+            { id: 'lib_1', name: 'Standard Comics', path: 'C:\\Comics', isManga: false, isDefault: true }
+        ]);
+        mocks.storedFolderProblem.mockImplementation((p: string) =>
+            p === 'C:\\Comics' ? '"C:\\Comics" is a Windows path, and Omnibus runs inside a Linux container that can\'t see it.' : null
+        );
+        vi.mocked(fs.copy).mockClear();
+        vi.mocked(fs.ensureDir).mockClear();
+
+        const result = await Importer.importRequest('req_1');
+
+        expect(result).toBe(false);
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('library "Standard Comics"'), 'error');
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('"C:\\Comics" is a Windows path'), 'error');
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('Settings → Library & Files'), 'error');
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(vi.mocked(fs.ensureDir).mock.calls.some(([p]) => String(p).includes('C:\\Comics'))).toBe(false);
+        expect(mocks.createIssue).not.toHaveBeenCalled();
     });
 
     it('should stall the request if the downloaded file is missing from the hard drive', async () => {

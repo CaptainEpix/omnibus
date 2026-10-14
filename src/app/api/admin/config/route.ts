@@ -122,7 +122,22 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    
+
+    // Folders are stored exactly as they are checked below (beta.018 follow-up): serverPathProblem
+    // trims, so a folder typed with a space around it passed, was stored raw, and " /data/comics" is
+    // a RELATIVE path. Every value the check sees is the value that's written.
+    const trimmed = (v: unknown) => (typeof v === 'string' ? v.trim() : v);
+    const isRow = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
+    if (Array.isArray(body?.libraries)) {
+        body.libraries = body.libraries.map((lib: unknown) => (isRow(lib) ? { ...lib, path: trimmed(lib.path) } : lib));
+    }
+    if (Array.isArray(body?.downloadClients)) {
+        body.downloadClients = body.downloadClients.map((c: unknown) => (isRow(c) && 'localPath' in c ? { ...c, localPath: trimmed(c.localPath) } : c));
+    }
+    if (body?.settings && typeof body.settings === 'object' && 'download_path' in body.settings) {
+        body.settings = { ...body.settings, download_path: trimmed(body.settings.download_path) };
+    }
+
     const {
         settings,
         libraries, 

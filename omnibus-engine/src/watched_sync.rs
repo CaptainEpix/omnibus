@@ -454,6 +454,24 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 continue;
             };
 
+            // Never write where the server can't keep it (beta.018 follow-up): the engine runs as root,
+            // so a Root Path the server can't use - "C:\Comics" under Docker, a leading space, a typo
+            // nothing is mounted at - would be CREATED inside the container and the comic lost on the
+            // next image update. The file stays in the watched folder until the path is fixed.
+            let target_root: Option<String> = libraries
+                .iter()
+                .find(|lib| lib.get::<String, _>("id") == target_lib_id)
+                .map(|lib| lib.get::<String, _>("path"));
+            if let Some(problem) = crate::server_paths::series_folder_problem(&dest_folder, target_root.as_deref()) {
+                log::error!(
+                    "[Watched Sync] Not importing {:?} for '{}': {} The file stays in the watched folder and is imported on the next sweep after the fix.",
+                    path.file_name().unwrap_or_default(),
+                    series_name,
+                    problem
+                );
+                continue;
+            }
+
             let _ = std::fs::create_dir_all(&dest_folder);
 
             // Converted archives (cbr/rar/cb7) and zip/cbz all normalize to .cbz; an .epub is left as

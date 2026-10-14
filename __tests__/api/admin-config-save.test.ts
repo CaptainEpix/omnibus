@@ -183,6 +183,25 @@ describe('Settings save: folders must be paths the server itself can use', () =>
         expect(tx.library.create).toHaveBeenCalledWith({ data: expect.objectContaining({ path: '/data/comics' }) });
     });
 
+    // beta.018 follow-up: the check trims, so " /data/comics" passed - but the raw value was stored,
+    // and with its leading space it's a RELATIVE path. What's stored is now what was checked.
+    it('stores the folders trimmed, exactly as they were checked', async () => {
+        const client = { id: 'tmp_c', name: 'SABnzbd', type: 'sab', url: 'http://sab:8080', remotePath: '/downloads', localPath: ' /data/downloads ' };
+        const res = await POST(mockReq({
+            libraries: [lib(' /data/comics ')],
+            downloadClients: [client],
+            settings: { download_path: '/data/downloads  ' },
+        }));
+
+        expect(res.status).toBe(200);
+        expect(tx.library.create).toHaveBeenCalledWith({ data: expect.objectContaining({ path: '/data/comics' }) });
+        expect(tx.downloadClient.create).toHaveBeenCalledWith({ data: expect.objectContaining({ localPath: '/data/downloads' }) });
+        expect(mocks.settingUpsert).toHaveBeenCalledWith(expect.objectContaining({
+            where: { key: 'download_path' },
+            create: expect.objectContaining({ value: '/data/downloads' }),
+        }));
+    });
+
     it('keeps drive-letter paths working on a native Windows install', async () => {
         restorePlatform?.();
         restorePlatform = pinPlatform('win32');

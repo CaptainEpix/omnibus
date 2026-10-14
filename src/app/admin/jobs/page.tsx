@@ -18,6 +18,7 @@ import {
 } from "lucide-react"
 import { getErrorMessage } from "@/lib/utils/error"
 import { SCHEDULE_DEFAULTS } from "@/lib/schedule-defaults"
+import { restoreCompleteToast, rememberRestoreWarnings, takeRestoreWarnings } from "@/lib/restore-warnings"
 
 const INTERVALS = [
     { label: "Disabled (Manual Only)", value: "0" },
@@ -82,6 +83,12 @@ export default function ScheduledJobsPage() {
   });
 
   const hasUnsavedChanges = isDataLoaded && initialStateHash !== "" && currentStateString !== initialStateHash;
+
+  // A restore's folder warnings, carried across the reload that follows it (restore-warnings.ts).
+  useEffect(() => {
+      const pending = takeRestoreWarnings();
+      if (pending.length > 0) toast(restoreCompleteToast(pending, ''));
+  }, [toast]);
 
   useEffect(() => {
       if (isDataLoaded && initialStateHash === "") {
@@ -259,8 +266,11 @@ export default function ScheduledJobsPage() {
           const data = await res.json();
 
           if (res.ok) {
-              toast({ title: "Restore Complete", description: "Your library and progress data has been successfully merged!" });
-              setTimeout(() => window.location.reload(), 1500); 
+              // Folders the server can't use don't stop a restore - it says which ones to fix, and
+              // the warnings are shown again after the reload (restore-warnings.ts).
+              toast(restoreCompleteToast(data.warnings, "Your library and progress data has been successfully merged!"));
+              rememberRestoreWarnings(data.warnings);
+              setTimeout(() => window.location.reload(), 1500);
           } else {
               throw new Error(data.error || "Failed to restore");
           }

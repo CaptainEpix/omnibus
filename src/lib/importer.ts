@@ -22,6 +22,7 @@ import { issueFileName, issuePaddingFromSetting, seriesFolderSegments, type Nami
 import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 import { readZipEntryNames } from '@/lib/utils/archive-pages';
 import { fixMagicNumberSync } from '@/lib/utils/archive-signature';
+import { storedFolderProblem } from '@/lib/utils/stored-folder';
 import { requeueWithNextRelease } from '@/lib/requeue';
 
 // Engine nested-pack helper (list when destDir is omitted, extract when given). Returns null on any
@@ -609,6 +610,15 @@ export const Importer = {
 
     if (!libraryRoot) {
       Logger.log("[Importer] No Library Path found for this import! Please add a Library in Settings.", "error");
+      return false;
+    }
+
+    // A Root Path saved before Settings checked it (a Windows path under Docker, a leading space, a
+    // folder nothing is mounted at) used to surface only as a bare EACCES deep in the copy. Name the
+    // library and the fix instead, and touch nothing (beta.018 follow-up).
+    const rootProblem = storedFolderProblem(libraryRoot, { example: '/data/comics' });
+    if (rootProblem) {
+      Logger.log(`[Importer] Can't import into library "${targetLibrary.name || 'Unnamed'}": ${rootProblem} Fix its Root Path in Settings → Library & Files.`, "error");
       return false;
     }
 

@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useToast } from "@/components/ui/use-toast"
+import { restoreCompleteToast } from "@/lib/restore-warnings"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
@@ -193,7 +194,9 @@ export default function SetupWizard() {
           const data = await res.json();
 
           if (res.ok) {
-              toast({ title: "Restore Complete", description: "Your server has been fully configured from backup!" });
+              // Folders the server can't use don't stop a restore - it says which ones to fix
+              // (restore-warnings.ts). Client navigation keeps the toast on screen.
+              toast(restoreCompleteToast(data.warnings, "Your server has been fully configured from backup!"));
               router.push('/login');
           } else {
               throw new Error(data.error || "Failed to restore");

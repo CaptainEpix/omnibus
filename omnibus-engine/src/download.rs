@@ -330,6 +330,15 @@ async fn establish_stream(
 }
 
 pub async fn stream_download(db: &sqlx::AnyPool, req: StreamRequest) -> Result<String> {
+    // The engine runs as root, so a download folder the server can't use (a relative Download Scan
+    // Root, or one that isn't mounted into this container) would be CREATED inside the container -
+    // where the web app can never pick the file up and the next image update deletes it. Refused
+    // first, with what to fix, before anything is fetched (beta.018 follow-up).
+    if let Some(problem) = crate::server_paths::download_destination_problem(&req.dest_path) {
+        log::error!("[Internal DL] {problem}");
+        bail!(problem);
+    }
+
     // For a getcomics.org /dls/ link, ANY failure to deliver the file automatically — an unsolved
     // Cloudflare challenge, OR a stalled/empty stream because the solver consumed getcomics' one-shot
     // signed download in its own browser (cookie-replay can't re-fetch it) — is best handed to the user
@@ -904,6 +913,30 @@ mod tests {
             dest_path: dest.clone(), min_size_bytes: Some(1), ext: Some("cbz".into()),
         };
         (dir, db, req, format!("{}.part", dest))
+    }
+
+    // beta.018 follow-up: the engine runs as root, so a download folder the server can't use (a
+    // relative Download Scan Root, or one not mounted into this container) would be CREATED inside the
+    // container - where the web app can never pick the file up. Refused before anything is fetched.
+    #[tokio::test]
+    async fn a_download_folder_the_server_cannot_use_is_refused_before_fetching() {
+        let (url, seen) = fake_server(vec![]).await;
+        let (dir, db, _, _) = dl_fixture(&url).await;
+        let to = |dest_path: String| StreamRequest {
+            request_id: "req_1".into(), url: url.clone(), headers: HashMap::new(),
+            dest_path, min_size_bytes: Some(1), ext: Some("cbz".into()),
+        };
+
+        let err = stream_download(&db.pool, to("downloads/GetComics/Pack.cbz".into())).await.unwrap_err();
+        assert!(err.to_string().contains("isn't a full path"), "{err}");
+
+        let missing_root = dir.join("not-mounted");
+        let err = stream_download(&db.pool, to(missing_root.join("GetComics").join("Pack.cbz").to_string_lossy().to_string())).await.unwrap_err();
+        assert!(err.to_string().contains("doesn't exist on the server"), "{err}");
+        assert!(!missing_root.exists(), "the missing Download Scan Root is never created");
+
+        assert!(seen.lock().unwrap().is_empty(), "nothing was fetched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

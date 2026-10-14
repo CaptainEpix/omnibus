@@ -28,6 +28,7 @@ mod download;
 mod log_forward;
 mod renamer;
 mod secret_crypto;
+mod server_paths;
 
 use axum::{routing::{get, post}, Router, Json, extract::{State, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response};
 use serde::{Deserialize, Serialize};

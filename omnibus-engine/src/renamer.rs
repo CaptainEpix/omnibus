@@ -253,6 +253,16 @@ pub async fn run_bulk_rename(
                 continue;
             }
         };
+        // The engine runs as root: renaming under a Root Path the server can't use would create the
+        // target folder inside the container, where the next image update deletes it (beta.018
+        // follow-up, same check as the watched-folder import).
+        if let Some(problem) = crate::server_paths::folder_problem(&library_root, "/data/comics") {
+            log::warn!(
+                "[Renamer] Skipping series \"{}\" - its library's Root Path can't be used: {} Fix it in Settings → Library & Files.",
+                s.name, problem
+            );
+            continue;
+        }
         let current_folder = s.folder_path.clone();
 
         // --- Compute the target folder from the active pattern (naming.rs, twinned with Node) ---
@@ -666,6 +676,34 @@ mod tests {
         assert!(path_of("cv_book").await.ends_with("Batman Vol. 002 (2016).cbz"));
         assert!(path_of("issue_3").await.ends_with("Batman #003.cbz"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // beta.018 follow-up: the engine runs as root, so renaming under a Root Path the server can't use
+    // (here: a full path nothing is mounted at) would CREATE it - inside the container, where the next
+    // image update deletes the moved files. The series is skipped instead, and nothing is created.
+    #[tokio::test]
+    async fn bulk_rename_skips_a_series_whose_library_root_does_not_exist() {
+        let (db, base) = rename_fixture("unmounted_root").await;
+        let missing_root = base.join("not-mounted");
+        let messy = base.join("inbox");
+        fs::create_dir_all(&messy).unwrap();
+        let source = messy.join("Batman 1.cbz");
+        fs::write(&source, b"data").unwrap();
+        let messy_str = messy.to_string_lossy().replace('\\', "/");
+
+        sqlx::query(r#"INSERT INTO "Library" (id, path, "isDefault", "isManga") VALUES ('lib_1', $1, 1, 0)"#)
+            .bind(missing_root.to_string_lossy().replace('\\', "/")).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Series" (id, name, publisher, year, "folderPath", "libraryId", "isManga") VALUES ('s1', 'Batman', 'DC Comics', 2016, $1, 'lib_1', 0)"#)
+            .bind(&messy_str).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", name, number, "filePath") VALUES ('i1', 's1', 'Batman #1', '1', $1)"#)
+            .bind(source.to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+
+        let summary = run_bulk_rename(&db, &["s1".to_string()], "{Publisher}/{Series} ({Year})", "{Series} #{Issue}", None, None, IssuePadding::Three).await.unwrap();
+
+        assert_eq!((summary.files_renamed, summary.folders_renamed), (0, 0));
+        assert!(!missing_root.exists(), "the missing Root Path is never created");
+        assert!(source.exists(), "the file stays where it was");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
