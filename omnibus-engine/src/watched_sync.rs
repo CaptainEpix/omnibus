@@ -267,11 +267,16 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     let mut synced_series_ids = std::collections::HashSet::new();
 
     for file_data in preprocessed_files {
+        // #240 PR B: the import handoff is keyed on the file AS IT WAS HANDED OVER, so it is
+        // recorded against the original name — the CBR→CBZ conversion above must not move the key.
+        let handoff_path = file_data.original_path.clone();
         let path = file_data.working_path;
         
         if let Some(info) = file_data.meta {
             if info.series.is_none() {
-                if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                    unmatched_count += 1;
+                }
                 continue;
             }
 
@@ -333,7 +338,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
 
             if meta_source == "LOCAL" || meta_id.is_empty() {
                 log::info!("[Watched Sync] '{}' has no ComicVine/Metron ID; routing to unmatched for review.", series_name);
-                if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                    unmatched_count += 1;
+                }
                 continue;
             }
 
@@ -411,7 +418,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 let folder_values = comicinfo_naming(&info, year, info.imprint.clone(), &issue_num, None);
                 let Some(segments) = naming::folder_segments(&naming_settings.folder, &folder_values) else {
                     log::warn!("[Watched Sync] The folder pattern \"{}\" gives no folder inside the library for '{}'; routing to unmatched for review.", naming_settings.folder, series_name);
-                    if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                    if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                        unmatched_count += 1;
+                    }
                     continue;
                 };
                 dest_folder = segments.iter().fold(PathBuf::from(&fallback_lib_path), |folder, segment| folder.join(segment));
@@ -450,7 +459,7 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
             let file_values = comicinfo_naming(&info, year, Some(effective_imprint.clone()), &issue_num, issue_release);
             let Some(new_filename) = naming::file_name(pattern_to_use, &file_values, naming_settings.padding) else {
                 log::warn!("[Watched Sync] The file pattern \"{}\" leaves no name for '{}'; routing to unmatched for review.", pattern_to_use, series_name);
-                if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await { unmatched_count += 1; }
                 continue;
             };
 
@@ -587,6 +596,10 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                     if row_annual == is_annual && crate::metadata::is_same_issue(&n, &issue_num) { Some(r.get::<String, _>("id")) } else { None }
                 });
 
+                // #240 PR B: the id the handoff reports is the issue row this file really landed
+                // in — the existing row when that number already had one, the new id otherwise.
+                let handoff_issue_id = existing_issue_id.clone().unwrap_or_else(|| issue_id.clone());
+
                 let res = if let Some(eid) = existing_issue_id {
                     sqlx::query(&format!(
                         // Preserve already-present data on re-import (parity with importer.ts dedupe):
@@ -636,6 +649,12 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
 
                 if let Err(e) = res {
                     log::error!("[Watched Sync] Failed to upsert issue {:?}: {:?}", final_dest.file_name(), e);
+                    // #240 PR B: the sweep did handle the file — it just could not become a library
+                    // issue. Recorded as unmatched so the batch settles instead of waiting on a row
+                    // that nothing will ever close; the health check still flags the request.
+                    record_handoff(&db, &watched_dir, &handoff_path, HANDOFF_UNMATCHED, None, None).await;
+                } else {
+                    record_handoff(&db, &watched_dir, &handoff_path, HANDOFF_IMPORTED, Some(&handoff_issue_id), Some(&file_path_str)).await;
                 }
 
                 synced_series_ids.insert(series_id);
@@ -644,7 +663,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 log::warn!("Skipping file {:?}. It might be locked by another program or cross-drive move failed.", path.file_name());
             }
         } else {
-            if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+            if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                unmatched_count += 1;
+            }
         }
     }
 
@@ -660,6 +681,42 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     }
 
     Ok((success_count, unmatched_count, format!("Processed watched folder. Imported: {}. Moved to unmatched: {}.", success_count, unmatched_count)))
+}
+
+/// What a handed-off file became (#240 PR B, "ImportHandoff".outcome). PENDING is the importer's
+/// row; the sweep only ever writes these two.
+const HANDOFF_IMPORTED: &str = "IMPORTED";
+const HANDOFF_UNMATCHED: &str = "UNMATCHED";
+
+/// #240 PR B: record what happened to a file this batch was handed, so the request that asked for
+/// it is closed on the STORAGE and not on the routing. Keyed on the file's path relative to the
+/// watched folder — the same key the importer wrote — and only on the newest row still PENDING: an
+/// older settled row under the same name belongs to an earlier batch and is left alone. Best-effort
+/// by design: a file nobody queued, or a busy database, must never fail the import itself.
+async fn record_handoff(db: &Db, watched_dir: &str, handoff_path: &Path, outcome: &str, issue_id: Option<&str>, destination: Option<&str>) {
+    let rel = handoff_path
+        .strip_prefix(watched_dir)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| handoff_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    if rel.is_empty() {
+        return;
+    }
+
+    // Dual-dialect rules of db.rs: positional placeholders in order, now_expr() for the timestamp
+    // (Prisma's SQLite connector stores DateTime columns as INTEGER epoch-milliseconds).
+    let sql = format!(
+        r#"UPDATE "ImportHandoff" SET outcome = $1, "issueId" = $2, destination = $3, "updatedAt" = {now}
+           WHERE id = (SELECT id FROM "ImportHandoff" WHERE "relPath" = $4 AND outcome = 'PENDING'
+                       ORDER BY "createdAt" DESC LIMIT 1)"#,
+        now = db.now_expr()
+    );
+    match sqlx::query(&sql).bind(outcome).bind(issue_id).bind(destination).bind(&rel).execute(&db.pool).await {
+        Ok(res) if res.rows_affected() > 0 => {
+            log::debug!("[Watched Sync] Import handoff {} -> {} ({})", rel, outcome, destination.unwrap_or(""));
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[Watched Sync] Could not stamp the import handoff for {}: {:?}", rel, e),
+    }
 }
 
 fn extract_comicinfo(path: &Path) -> Option<ComicInfo> {
@@ -768,6 +825,23 @@ fn unique_unmatched_dest(unmatched_dir: &Path, file_name: &std::ffi::OsStr) -> O
     (1..=MAX_UNMATCHED_COPIES)
         .map(|n| unmatched_dir.join(copy_name(file_name, n)))
         .find(|candidate| !taken(candidate))
+}
+
+/// #240 PR B: every exit that parks a file in /unmatched stamps its handoff row before leaving the
+/// file behind — the sweep did handle it, so a request waiting on that file is closed on this
+/// outcome instead of waiting on a PENDING row nothing will ever touch. Returns whether the file
+/// actually moved (the caller counts it as unmatched when it did).
+///
+/// One helper because there are five such exits, and one of them (the file pattern leaving no name)
+/// used to move the file without stamping, which left its whole batch PENDING forever and the
+/// request waiting on it IMPORTING until a person looked (#240 review, hankscafe).
+async fn park_to_unmatched(db: &Db, watched_dir: &str, handoff_path: &Path, path: &Path, unmatched_dir: &str) -> bool {
+    if move_to_unmatched(path, unmatched_dir).is_ok() {
+        record_handoff(db, watched_dir, handoff_path, HANDOFF_UNMATCHED, None, None).await;
+        true
+    } else {
+        false
+    }
 }
 
 fn move_to_unmatched(src: &Path, unmatched_dir: &str) -> Result<()> {
@@ -1268,5 +1342,147 @@ mod tests {
         fake.finish_one();
         next.await.unwrap();
         assert_eq!(fake.started.load(SeqCst), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A file-backed sqlite of its own holding the `ImportHandoff` table exactly as Prisma creates
+    /// it on SQLite: TEXT ids, DATETIME (epoch-ms) timestamps — the two processes share one file.
+    async fn handoff_db(base: &Path) -> Db {
+        let db_file = base.join("handoff.db");
+        std::fs::File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 1).await.expect("connect file-backed sqlite");
+
+        // The model exactly as Prisma creates it on SQLite: TEXT ids, DATETIME (epoch-ms) timestamps.
+        sqlx::query(
+            r#"CREATE TABLE "ImportHandoff" (
+                id TEXT PRIMARY KEY NOT NULL,
+                "batchId" TEXT NOT NULL,
+                "requestIds" TEXT NOT NULL DEFAULT '[]',
+                "relPath" TEXT NOT NULL,
+                "volumeId" TEXT,
+                "metadataSource" TEXT,
+                outcome TEXT NOT NULL DEFAULT 'PENDING',
+                "issueId" TEXT,
+                destination TEXT,
+                "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "updatedAt" DATETIME NOT NULL
+            )"#,
+        )
+        .execute(&db.pool)
+        .await
+        .expect("create handoff table");
+
+        db
+    }
+
+    /// #240 PR B: the sweep's whole job in the handoff is to stamp a file's outcome under the key
+    /// the importer wrote (its name relative to the watched folder), on Prisma's real SQLite column
+    /// types — the two processes share one database file.
+    #[tokio::test]
+    async fn stamps_the_newest_pending_handoff_row_for_the_relative_path() {
+        let base = std::env::temp_dir().join(format!("omnibus_handoff_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let db = handoff_db(&base).await;
+
+        let watched = base.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let watched_str = watched.to_string_lossy().to_string();
+        let routed = watched.join("Pack #1.cbz");
+        std::fs::File::create(&routed).and_then(|mut f| f.write_all(b"x")).expect("write fixture file");
+        let rel = "Pack #1.cbz";
+
+        // Two batches, same file name: the older row is already settled, the newer one is pending.
+        for (id, outcome, created) in [("old", "UNMATCHED", 1_000_i64), ("new", "PENDING", 2_000_i64)] {
+            sqlx::query(
+                r#"INSERT INTO "ImportHandoff" (id, "batchId", "requestIds", "relPath", outcome, "createdAt", "updatedAt")
+                   VALUES ($1, 'b1', '[]', $2, $3, $4, $4)"#,
+            )
+            .bind(id)
+            .bind(rel)
+            .bind(outcome)
+            .bind(created)
+            .execute(&db.pool)
+            .await
+            .expect("seed handoff row");
+        }
+
+        // A file nobody queued: no row to stamp, and no error either.
+        record_handoff(&db, &watched_str, &watched.join("Stranger.cbz"), HANDOFF_UNMATCHED, None, None).await;
+
+        record_handoff(&db, &watched_str, &routed, HANDOFF_IMPORTED, Some("issue-1"), Some("/comics/Pack #1.cbz")).await;
+
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, outcome, "issueId", destination FROM "ImportHandoff" ORDER BY "createdAt""#,
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read handoff rows");
+
+        assert_eq!(rows.len(), 2, "no row is invented for a file nobody queued");
+        assert_eq!(rows[0].0, "old");
+        assert_eq!(rows[0].1, "UNMATCHED", "an already-settled row is never rewritten");
+        assert_eq!(rows[1].0, "new");
+        assert_eq!(rows[1].1, "IMPORTED");
+        assert_eq!(rows[1].2.as_deref(), Some("issue-1"));
+        assert_eq!(rows[1].3.as_deref(), Some("/comics/Pack #1.cbz"));
+
+        // A second pass over the same file leaves the row it already settled alone.
+        record_handoff(&db, &watched_str, &routed, HANDOFF_UNMATCHED, None, None).await;
+        let (outcome,): (String,) = sqlx::query_as(r#"SELECT outcome FROM "ImportHandoff" WHERE id = 'new'"#)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read settled row");
+        assert_eq!(outcome, "IMPORTED");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #240 review (hankscafe): the fifth exit — the file pattern leaving no name — used to move the
+    /// file to /unmatched without stamping its row, which left the whole batch PENDING forever and
+    /// the request waiting on it IMPORTING until a person looked. Every park now goes through
+    /// `park_to_unmatched`, so this pins the shared behaviour: the file lands in /unmatched AND its
+    /// row is settled.
+    #[tokio::test]
+    async fn parking_a_file_settles_its_pending_handoff_row() {
+        let base = std::env::temp_dir().join(format!("omnibus_handoff_park_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let db = handoff_db(&base).await;
+
+        let watched = base.join("watched");
+        let unmatched = base.join("unmatched");
+        std::fs::create_dir_all(&watched).unwrap();
+        // The sweep creates this up front (`process_watched_folder`); the park needs it to exist.
+        std::fs::create_dir_all(&unmatched).unwrap();
+        let watched_str = watched.to_string_lossy().to_string();
+        let file = watched.join("Pack #1.cbz");
+        std::fs::File::create(&file).and_then(|mut f| f.write_all(b"x")).expect("write fixture file");
+
+        sqlx::query(
+            r#"INSERT INTO "ImportHandoff" (id, "batchId", "requestIds", "relPath", outcome, "createdAt", "updatedAt")
+               VALUES ('row1', 'b1', '["req_1"]', 'Pack #1.cbz', 'PENDING', 1000, 1000)"#,
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed handoff row");
+
+        let moved = park_to_unmatched(&db, &watched_str, &file, &file, &unmatched.to_string_lossy()).await;
+
+        assert!(moved, "the file left the watched folder");
+        assert!(!file.exists());
+        assert!(unmatched.join("Pack #1.cbz").exists(), "and it is parked in /unmatched");
+        let (outcome,): (String,) = sqlx::query_as(r#"SELECT outcome FROM "ImportHandoff" WHERE id = 'row1'"#)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the row");
+        assert_eq!(outcome, "UNMATCHED", "the batch settles instead of waiting on a PENDING row");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
