@@ -763,31 +763,23 @@ export async function POST(request: Request) {
         if (pendingRequests.length > 0) {
             const seriesIssues = await prisma.issue.findMany({ where: { series: { metadataId: targetMetaId } } });
             const requestsToComplete = [];
-            const reviewedRequestsToComplete = [];
 
             for (const dbReq of pendingRequests) {
                 const issueNumber = issueNumberOf(dbReq);
                 if (!issueNumber) continue;
                 const matchingIssue = seriesIssues.find(i => isSameIssue(i.number, issueNumber) && i.filePath && i.filePath.length > 0);
 
-                if (matchingIssue) {
-                    // A NEEDS_REVIEW row was never announced as available: the match that delivered
-                    // the issue is the news, so it closes with `notified: false` and rings once.
-                    if (dbReq.status === 'NEEDS_REVIEW') reviewedRequestsToComplete.push(dbReq.id);
-                    else requestsToComplete.push(dbReq.id);
-                }
+                if (matchingIssue) requestsToComplete.push(dbReq.id);
             }
 
             if (requestsToComplete.length > 0) {
+                // The match that delivered the issue is the news, so every request it closes rings
+                // the "available" bell once — `notified: false`, as the importer closes them. A
+                // DOWNLOADING / PENDING / MANUAL_DDL row whose "Downloading" line the requester had
+                // already cleared (notified: true) used to close silently; a NEEDS_REVIEW row was
+                // never announced at all.
                 await prisma.request.updateMany({
                     where: { id: { in: requestsToComplete } },
-                    data: { status: 'COMPLETED', progress: 100 }
-                });
-            }
-
-            if (reviewedRequestsToComplete.length > 0) {
-                await prisma.request.updateMany({
-                    where: { id: { in: reviewedRequestsToComplete } },
                     data: { status: 'COMPLETED', progress: 100, notified: false }
                 });
             }

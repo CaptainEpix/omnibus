@@ -843,19 +843,28 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
             });
         });
 
-        it('still closes MANUAL_DDL/PENDING/DOWNLOADING rows the way it always did, notified untouched', async () => {
+        // A DOWNLOADING / PENDING / MANUAL_DDL request has usually rung the bell once already
+        // ("Downloading"), and the requester who cleared it has notified: true. Closing it COMPLETED
+        // without resetting that left the "available" line silent — the importer always closes with
+        // notified: false, so a match has to as well.
+        it('rings the "available" bell for every request it closes, not only a reviewed one', async () => {
             requestsHeld([
                 { id: 'req_pending', status: 'PENDING', issueNumber: '37', activeDownloadName: 'Batman #37' },
+                { id: 'req_downloading', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #31-40 (2016)' },
+                { id: 'req_manual', status: 'MANUAL_DDL', issueNumber: '37', activeDownloadName: 'Batman #37' },
             ]);
             onDiskIssues([{ number: '37', filePath: '/comics/DC Comics/Batman (2016)/Batman #037.cbz' }]);
 
             const res = await POST(matchReq());
             expect(res.status).toBe(200);
 
-            expect(mocks.updateManyRequests).toHaveBeenCalledWith({
-                where: { id: { in: ['req_pending'] } },
-                data: { status: 'COMPLETED', progress: 100 },
-            });
+            const closed = new Map<string, Record<string, unknown>>();
+            for (const [args] of mocks.updateManyRequests.mock.calls as [{ where: { id: { in: string[] } }; data: Record<string, unknown> }][]) {
+                for (const id of args.where.id.in) closed.set(id, args.data);
+            }
+            for (const id of ['req_pending', 'req_downloading', 'req_manual']) {
+                expect(closed.get(id)).toEqual({ status: 'COMPLETED', progress: 100, notified: false });
+            }
         });
 
         it('leaves a NEEDS_REVIEW request open while its issue is not on disk', async () => {
