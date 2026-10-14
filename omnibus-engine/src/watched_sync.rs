@@ -713,8 +713,60 @@ fn copy_then_replace(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The name a file takes in /unmatched when its own is already there: "<stem> (copy N).<ext>",
+/// the same rule as the upload route (src/lib/utils/unique-path.ts). Never a bare " (N)": the
+/// filename parser reads a trailing bare number as the issue number on scene-style names, and the
+/// Smart Matcher numbers /unmatched files with it ("Saga 054 (2018) (Digital) (1)" parses as #1).
+fn copy_name(file_name: &std::ffi::OsStr, n: u32) -> std::ffi::OsString {
+    let as_path = Path::new(file_name);
+    let mut name = std::ffi::OsString::new();
+    match (as_path.file_stem(), as_path.extension()) {
+        (Some(stem), Some(ext)) => {
+            name.push(stem);
+            name.push(format!(" (copy {}).", n));
+            name.push(ext);
+        }
+        _ => {
+            name.push(file_name);
+            name.push(format!(" (copy {})", n));
+        }
+    }
+    name
+}
+
+/// How many copy numbers are tried before the move gives up (the file then stays in the watched
+/// folder) instead of searching forever.
+const MAX_UNMATCHED_COPIES: u32 = 9999;
+
+/// Where `file_name` lands in /unmatched without replacing anything: its own name when that is
+/// free, else the first free "(copy N)". Anything at a name counts as taken - a file, a folder, a
+/// dangling link.
+fn unique_unmatched_dest(unmatched_dir: &Path, file_name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let taken = |candidate: &Path| std::fs::symlink_metadata(candidate).is_ok();
+    let own = unmatched_dir.join(file_name);
+    if !taken(&own) {
+        return Some(own);
+    }
+    (1..=MAX_UNMATCHED_COPIES)
+        .map(|n| unmatched_dir.join(copy_name(file_name, n)))
+        .find(|candidate| !taken(candidate))
+}
+
 fn move_to_unmatched(src: &Path, unmatched_dir: &str) -> Result<()> {
-    let dest = PathBuf::from(unmatched_dir).join(src.file_name().unwrap());
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{:?} has no file name to move into unmatched", src))?;
+    // Never over a file already waiting in /unmatched: two ComicInfo-less files with one name (two
+    // packs, or one name in two subfolders of the watched folder) used to leave only the last one.
+    let dest = unique_unmatched_dest(Path::new(unmatched_dir), file_name)
+        .ok_or_else(|| anyhow::anyhow!("no free name for {:?} in {}", file_name, unmatched_dir))?;
+    if dest.file_name() != Some(file_name) {
+        log::info!(
+            "[Watched Sync] {:?} is already waiting in unmatched; keeping both - this one is {:?}.",
+            file_name,
+            dest.file_name().unwrap_or_default()
+        );
+    }
     robust_move(src, &dest)?;
     Ok(())
 }
@@ -865,6 +917,60 @@ mod tests {
         assert!(src.exists(), "a failed move keeps the source");
         assert_eq!(names_in(&to), vec!["Batman 001.cbz"], "the staged copy is removed");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ==== /unmatched never replaces a file: two ComicInfo-less files with one name (two packs, or
+    // the same name in two subfolders of the watched folder, flattened in one sweep) used to leave
+    // only the second - the first was silently overwritten. The newcomer takes " (copy N)", the
+    // rule the upload route uses too: never a bare " (N)", which the filename parser reads as the
+    // issue number on scene-style names ("Saga 054 (2018) (Digital) (1)" parses as #1).
+
+    #[test]
+    fn move_to_unmatched_keeps_the_file_already_there() {
+        let (base, src, to) = move_fixture();
+        std::fs::write(to.join("Batman 001.cbz"), b"the first").unwrap();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(std::fs::read(to.join("Batman 001.cbz")).unwrap(), b"the first", "the file already in unmatched is untouched");
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 1).cbz")).unwrap(), b"the comic", "the newcomer sits beside it");
+        assert!(!src.exists(), "the source is removed after the move");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_to_unmatched_takes_the_next_free_copy_number() {
+        let (base, src, to) = move_fixture();
+        std::fs::write(to.join("Batman 001.cbz"), b"the first").unwrap();
+        std::fs::write(to.join("Batman 001 (copy 1).cbz"), b"the second").unwrap();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(names_in(&to), vec!["Batman 001 (copy 1).cbz", "Batman 001 (copy 2).cbz", "Batman 001.cbz"]);
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 1).cbz")).unwrap(), b"the second");
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 2).cbz")).unwrap(), b"the comic");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_to_unmatched_keeps_the_name_when_it_is_free() {
+        let (base, src, to) = move_fixture();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(names_in(&to), vec!["Batman 001.cbz"]);
+        assert_eq!(std::fs::read(to.join("Batman 001.cbz")).unwrap(), b"the comic");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_names_keep_the_extension_last_like_the_upload_route() {
+        let name = |s: &str, n: u32| copy_name(std::ffi::OsStr::new(s), n).to_string_lossy().to_string();
+        assert_eq!(name("Saga 054 (2018) (Digital).cbz", 1), "Saga 054 (2018) (Digital) (copy 1).cbz");
+        assert_eq!(name("Batman 001.cbz", 12), "Batman 001 (copy 12).cbz");
+        assert_eq!(name("archive.tar.gz", 1), "archive.tar (copy 1).gz");
+        assert_eq!(name("README", 2), "README (copy 2)");
+        assert_eq!(name(".hidden", 1), ".hidden (copy 1)");
     }
 
     // ==== #243: {IssueYear} carried the SERIES year (ComicInfo <Volume>, else <Year>) for every

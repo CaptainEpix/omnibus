@@ -21,6 +21,7 @@ import { deleteUsenetSource } from '@/lib/utils/usenet-cleanup';
 import { issueFileName, issuePaddingFromSetting, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
 import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 import { readZipEntryNames } from '@/lib/utils/archive-pages';
+import { fixMagicNumberSync } from '@/lib/utils/archive-signature';
 import { requeueWithNextRelease } from '@/lib/requeue';
 
 // Engine nested-pack helper (list when destDir is omitted, extract when given). Returns null on any
@@ -39,36 +40,6 @@ async function engineNestedArchives(archivePath: string, destDir?: string): Prom
         Logger.log(`[Importer] Engine nested-pack offload unavailable, using local AdmZip: ${e.message}`, 'debug');
         return null;
     }
-}
-
-function fixMagicNumberSync(filePath: string): string {
-    try {
-        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return filePath;
-        const buffer = Buffer.alloc(4);
-        const fd = fs.openSync(filePath, 'r');
-        fs.readSync(fd, buffer, 0, 4, 0);
-        fs.closeSync(fd);
-        const hex = buffer.toString('hex').toLowerCase();
-        
-        const currentExt = path.extname(filePath).toLowerCase();
-        let trueExt = currentExt;
-
-        if (hex === '52617221') {
-            trueExt = '.cbr';
-        } else if (hex === '504b0304') {
-            trueExt = '.cbz';
-        }
-
-        if (trueExt !== currentExt && ((currentExt === '.cbz' || currentExt === '.zip') && trueExt === '.cbr' || (currentExt === '.cbr' || currentExt === '.rar') && trueExt === '.cbz')) {
-            Logger.log(`[Importer] Detected fake extension (${currentExt} -> ${trueExt}) on destination file! Renaming to match true signature...`, 'info');
-            const correctedPath = filePath.replace(/\.[^/.]+$/, trueExt);
-            fs.renameSync(filePath, correctedPath);
-            return correctedPath;
-        }
-    } catch (e: any) {
-        Logger.log(`[Importer Debug] Failed to verify file signature for ${filePath}: ${e.message}`, 'warn');
-    }
-    return filePath;
 }
 
 // Give a freshly imported series a real on-disk cover the instant the import lands, so the library
