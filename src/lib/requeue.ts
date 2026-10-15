@@ -6,6 +6,7 @@
 // is parked STALLED instead (the monitor's dead-request sweep takes it from there).
 import { prisma } from '@/lib/db';
 import { Logger } from '@/lib/logger';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 const MAX_RETRIES = 3;
 
@@ -68,6 +69,8 @@ export async function requeueWithNextRelease(
         searchName = `${series.name} #${issueMatch ? issueMatch[1] : '1'}`;
     }
 
-    await searchAndDownload(req.id, searchName, searchYear, series?.publisher || 'Unknown', series?.isManga || false, false);
+    // Someone is still waiting on this request, so the re-search goes ahead of the Series Monitor's
+    // own searches - but behind a fresh single ask (job-priority.ts).
+    await searchAndDownload(req.id, searchName, searchYear, series?.publisher || 'Unknown', series?.isManga || false, false, JOB_PRIORITY.BULK);
     return 'requeued';
 }

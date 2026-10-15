@@ -20,6 +20,7 @@ vi.mock('@/lib/db', () => ({
 vi.mock('@/lib/automation', () => ({ searchAndDownload: mocks.searchAndDownload }));
 
 import { requeueWithNextRelease } from '@/lib/requeue';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 describe('requeueWithNextRelease', () => {
     beforeEach(() => {
@@ -46,7 +47,9 @@ describe('requeueWithNextRelease', () => {
                 failedLinks: JSON.stringify(['older', 'https://dl.example/x.cbz', 'X-Men #38 (2026).cbz']),
             },
         });
-        expect(mocks.searchAndDownload).toHaveBeenCalledWith('r1', 'X-Men #38', '2024', 'Marvel', false, false);
+        // The re-search is for a request someone is still waiting on, so it goes ahead of the Series
+        // Monitor's own searches — but behind a fresh single ask.
+        expect(mocks.searchAndDownload).toHaveBeenCalledWith('r1', 'X-Men #38', '2024', 'Marvel', false, false, JOB_PRIORITY.BULK);
     });
 
     it('never blocks the same entry twice', async () => {
@@ -68,7 +71,7 @@ describe('requeueWithNextRelease', () => {
         expect(outcome).toBe('requeued');
         expect(mocks.findFirstSeries).not.toHaveBeenCalled();
         expect(JSON.parse(mocks.updateRequest.mock.calls[0][0].data.failedLinks)).toEqual(['abc123']);
-        expect(mocks.searchAndDownload).toHaveBeenCalledWith('r2', 'Invincible Compendium', '2018', 'Unknown', false, false);
+        expect(mocks.searchAndDownload).toHaveBeenCalledWith('r2', 'Invincible Compendium', '2018', 'Unknown', false, false, JOB_PRIORITY.BULK);
     });
 
     it('after three tries the request is parked STALLED and nothing is searched', async () => {

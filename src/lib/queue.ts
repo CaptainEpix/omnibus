@@ -6,7 +6,8 @@ import { SystemNotifier } from './notifications';
 import { Mailer } from './mailer';
 import { apiClient as axios } from '@/lib/api-client';
 import { isReleasedYet } from '@/lib/utils';
-import { searchAndDownload } from '@/lib/automation';
+import { searchAndDownload, waitForSearchSlot } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import packageJson from '../../package.json';
 import { getErrorMessage } from '@/lib/utils/error';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
@@ -293,6 +294,9 @@ export function initWorker() {
                     }
 
                     try {
+                        // Searches start at least 5 s apart (automation.ts): the gap is kept here, as the
+                        // search starts, so the queue can order the searches by priority alone.
+                        await waitForSearchSlot();
                         const rustResponse = await fetch(ENGINE_URL + '/api/automation/search', {
                             method: 'POST',
                             headers: engineHeaders({ 'Content-Type': 'application/json' }),
@@ -759,8 +763,11 @@ export function initWorker() {
                     // handles a handful of files then re-enqueues the remainder, so this single
                     // worker is never blocked for a whole 400-file sweep. The processor owns
                     // progress/cancel/completion; enqueueNext is injected to avoid an import cycle.
+                    // The next chunk takes the top tier (job-priority.ts): queued with no priority it would
+                    // jump every search until the sweep ends; at REQUESTED it alternates with the searches
+                    // people asked for and still goes ahead of the bulk and background ones.
                     await processPageSweepChunk(job.data, (next) =>
-                        omnibusQueue.add('PAGE_SWEEP', next, { jobId: `PAGE_SWEEP_${next.runId}_${next.processed}` })
+                        omnibusQueue.add('PAGE_SWEEP', next, { jobId: `PAGE_SWEEP_${next.runId}_${next.processed}`, priority: JOB_PRIORITY.REQUESTED })
                     );
                     break;
                 }
@@ -931,7 +938,9 @@ export function initWorker() {
                         })
                         : [];
 
-                    // Request creation / UNRELEASED upgrade from the engine's candidates.
+                    // Request creation / UNRELEASED upgrade from the engine's candidates. Every search the
+                    // monitor starts (here and in Phases 3/3b) is BACKGROUND (job-priority.ts): a run can
+                    // queue hundreds, and a request someone makes meanwhile must not wait behind them.
                     for (const c of (monitorData.candidates || [])) {
                         // Identity first, name second (#240): the stored issue number survives the
                         // download overwriting activeDownloadName with a pack title, which is what made a
@@ -957,7 +966,7 @@ export function initWorker() {
                             if (alreadyReq.status === 'UNRELEASED' && c.is_released && !dateless) {
                                 details += `[UPGRADE] ${c.search_name} released. Triggering search...\n`;
                                 await prisma.request.update({ where: { id: alreadyReq.id }, data: { status: 'PENDING' } });
-                                searchAndDownload(alreadyReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga).catch(() => {});
+                                searchAndDownload(alreadyReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                 unreleasedUpgraded++;
                                 alreadyReq.status = 'PENDING';
                             }
@@ -982,7 +991,7 @@ export function initWorker() {
                             });
                             existingReqs.push(newReq);
                             if (c.is_released && !dateless) {
-                                searchAndDownload(newReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga).catch(() => {});
+                                searchAndDownload(newReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                 newRequestsFound++;
                             }
                         }
@@ -1016,7 +1025,7 @@ export function initWorker() {
                                 if (skeleton && skeleton.releaseDate) {
                                     if (isReleasedYet(skeleton.releaseDate, skeleton.releaseDate)) {
                                         await prisma.request.update({ where: { id: req.id }, data: { status: 'PENDING' } });
-                                        searchAndDownload(req.id, req.activeDownloadName || "", skeleton.releaseDate.split('-')[0], matchedSeries.publisher || "Unknown", matchedSeries.isManga).catch(() => {});
+                                        searchAndDownload(req.id, req.activeDownloadName || "", skeleton.releaseDate.split('-')[0], matchedSeries.publisher || "Unknown", matchedSeries.isManga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                         unreleasedUpgraded++;
                                     }
                                 }
@@ -1074,7 +1083,7 @@ export function initWorker() {
                         }
                         // Reset retryCount so a fresh find gets the cron's full download-retry budget.
                         await prisma.request.update({ where: { id: req.id }, data: { status: 'PENDING', retryCount: 0, progress: 0 } });
-                        searchAndDownload(req.id, req.activeDownloadName || "", searchYear, s?.publisher || "Unknown", s?.isManga || false).catch(() => {});
+                        searchAndDownload(req.id, req.activeDownloadName || "", searchYear, s?.publisher || "Unknown", s?.isManga || false, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                         parkedRetried++;
                     }
                     if (parkedRetried > 0) details += `[PARKED] Re-searched ${parkedRetried} parked request(s) (awaiting/manual/dead-stalled) after ${awaitingRetryDays}d.\n`;

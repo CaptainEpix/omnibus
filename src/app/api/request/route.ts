@@ -11,6 +11,7 @@ import { evaluateTrophies } from '@/lib/trophy-evaluator';
 import { detectManga } from '@/lib/manga-detector'; 
 import { isReleasedYet } from '@/lib/utils';
 import { searchAndDownload, processAutomationQueue } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import { getErrorMessage } from '@/lib/utils/error';
 import { syncSeriesMetadata } from '@/lib/metadata-fetcher'; 
 import { AuditLogger } from '@/lib/audit-logger';
@@ -446,7 +447,9 @@ export async function POST(request: NextRequest) {
       }
 
       if (createdRequests.length > 0) {
-        processAutomationQueue(createdRequests);
+        // A whole series is a bulk ask (job-priority.ts): ahead of the Series Monitor's own searches,
+        // behind another reader's single issue. A series missing just one issue is a single ask.
+        processAutomationQueue(createdRequests, createdRequests.length > 1 ? JOB_PRIORITY.BULK : JOB_PRIORITY.REQUESTED);
       }
 
       return NextResponse.json({ 
@@ -487,7 +490,8 @@ export async function POST(request: NextRequest) {
       }
 
       if (issueStatus === 'PENDING') {
-        searchAndDownload(newReq.id, searchName, year, safePublisher, isManga, skipIndexers).catch(e => Logger.log(getErrorMessage(e), 'error'));
+        // Someone is waiting on this one issue: the top tier (job-priority.ts).
+        searchAndDownload(newReq.id, searchName, year, safePublisher, isManga, skipIndexers, JOB_PRIORITY.REQUESTED).catch(e => Logger.log(getErrorMessage(e), 'error'));
       }
 
       evaluateTrophies(userId).catch(() => {});
@@ -589,6 +593,9 @@ export async function PATCH(request: NextRequest) {
       let shouldNotifyApproval = true;
       let approvalTitle = searchName || reqRecord.volumeId || "Unknown Comic";
       let approvalDesc = description;
+      // Approving a whole series sends one PATCH per issue: those searches are a bulk ask, the same
+      // batch the "N Issues Approved" alert gathers below (job-priority.ts).
+      let approvedInBatch = false;
 
       if (reqRecord.volumeId && reqRecord.volumeId !== "0") {
           const stillPendingApproval = await prisma.request.count({
@@ -601,6 +608,7 @@ export async function PATCH(request: NextRequest) {
 
           if (stillPendingApproval > 0) {
               shouldNotifyApproval = false;
+              approvedInBatch = true;
           } else {
               const twoHoursBefore = new Date(reqRecord.createdAt.getTime() - 2 * 60 * 60 * 1000);
               const twoHoursAfter = new Date(reqRecord.createdAt.getTime() + 2 * 60 * 60 * 1000);
@@ -615,6 +623,7 @@ export async function PATCH(request: NextRequest) {
               });
 
               if (batchApprovedCount > 1) {
+                  approvedInBatch = true;
                   approvalTitle = `${seriesNameForBatch} - ${batchApprovedCount} Issues Approved`;
                   approvalDesc = `An admin has approved your request for ${batchApprovedCount} issues of ${seriesNameForBatch}. They will begin downloading shortly.\n\n${description}`;
               }
@@ -641,7 +650,7 @@ export async function PATCH(request: NextRequest) {
           ? seriesIsManga
           : await detectManga({ name: searchName, publisher: { name: publisher } });
 
-      searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers).catch(e => Logger.log(getErrorMessage(e), 'error'));
+      searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers, approvedInBatch ? JOB_PRIORITY.BULK : JOB_PRIORITY.REQUESTED).catch(e => Logger.log(getErrorMessage(e), 'error'));
     }
 
     evaluateTrophies(userId).catch(err => {
