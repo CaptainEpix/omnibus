@@ -1,7 +1,7 @@
 use reqwest::Client;
 use scraper::{ElementRef, Html, Selector};
  
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use crate::prowlarr::ProwlarrResult;
 use serde::Serialize;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -543,6 +543,243 @@ pub fn parse_issue_range(title: &str) -> Option<(u32, u32)> {
     None
 }
 
+const GC_STOP_WORDS: [&str; 12] = ["the", "a", "an", "of", "and", "or", "vol", "volume", "issue", "black", "white", "blood"];
+const GC_OPEN_VARIANT_KEYWORDS: [&str; 7] = ["variant", "special edition", "director's cut", "directors cut", "facsimile", "black and white", "extended"];
+const GC_BOUNDED_VARIANT_KEYWORDS: [&str; 6] = ["noir", "b&w", "sketch", "blank", "virgin", "uncut"];
+const GC_PACK_TERMS: [&str; 7] = ["story arc", "pack", "complete", "collection", "bundle", "run", "chronological"];
+
+/// What a GetComics search knows about the request, for judging each post title. Pulled out of
+/// `search` so the relevance rules can be tested without fetching pages; the rules are the ones the
+/// search loop always ran, in the same order.
+pub(crate) struct PostFilter {
+    is_interactive: bool,
+    is_manga: bool,
+    allow_bulk_packs: bool,
+    clean_original: String,
+    req_num: Option<f32>,
+    is_looking_for_omnibus: bool,
+    is_looking_for_annual: bool,
+    user_wants_variant: bool,
+    original_query_words: Vec<String>,
+    reverse_guard_words: Vec<String>,
+    series_year: Option<String>,
+    expander: crate::search_engine::AcronymExpander,
+}
+
+impl PostFilter {
+    pub(crate) fn new(
+        original_name: &str,
+        is_interactive: bool,
+        is_manga: bool,
+        allow_bulk_packs: bool,
+        series_year: Option<&str>,
+        acronyms: &HashMap<String, String>,
+    ) -> Self {
+        // Query context derived from the ORIGINAL name (parity with performSearch's cleanOriginal).
+        // Normalize first ("#1: Book One" -> "#1", "….cbz" -> "…"): otherwise a subtitle keyword like
+        // "Book" flips this single-issue request into omnibus mode, and a leaked file extension ("cbz")
+        // or subtitle word gets enforced as a required title word — rejecting every real single-issue file.
+        let core_original = crate::search_engine::normalize_request_name(original_name);
+        let clean = |s: &str| s.replace([':', '-', '&'], " ")
+            .split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase();
+        let clean_original = clean(&core_original);
+        // The series words are compared acronym-expanded on both sides (the post title gets the same
+        // treatment in is_relevant), so "TMNT: The Last Ronin" and "Teenage Mutant Ninja Turtles - The
+        // Last Ronin" name one series. Number, year, edition and variant checks keep the raw name.
+        let expander = crate::search_engine::AcronymExpander::new(acronyms);
+        let clean_cmp = clean(&expander.expand(&core_original));
+        let user_wants_variant = GC_BOUNDED_VARIANT_KEYWORDS.iter().any(|k| clean_original.contains(k))
+            || GC_OPEN_VARIANT_KEYWORDS.iter().any(|k| clean_original.contains(k));
+        let req_num = crate::search_engine::extract_number(&clean_original, is_manga, false);
+        let is_looking_for_omnibus = Self::tpb_terms(is_manga).iter().any(|t| clean_original.contains(t));
+        let is_looking_for_annual = clean_original.contains("annual");
+
+        let original_query_words: Vec<String> = clean_cmp.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| !GC_STOP_WORDS.contains(w))
+            .map(|s| s.to_string())
+            .collect();
+
+        // Reverse-guard request words (#202): numeric-inclusive, built by the SAME pipeline as the
+        // release-title side (lock-step with filter_and_score's reverse_guard_words).
+        let reverse_guard_words = crate::search_engine::guard_query_words(&clean_cmp);
+
+        Self {
+            is_interactive,
+            is_manga,
+            allow_bulk_packs,
+            clean_original,
+            req_num,
+            is_looking_for_omnibus,
+            is_looking_for_annual,
+            user_wants_variant,
+            original_query_words,
+            reverse_guard_words,
+            series_year: series_year.map(str::to_string),
+            expander,
+        }
+    }
+
+    fn tpb_terms(is_manga: bool) -> Vec<&'static str> {
+        let mut terms = vec!["omnibus", "tpb", "compendium", "collection", "hc", "hardcover", "trade paperback"];
+        if !is_manga { terms.extend_from_slice(&["vol ", "volume ", "book "]); }
+        terms
+    }
+
+    pub(crate) fn clean_original(&self) -> &str {
+        &self.clean_original
+    }
+
+    pub(crate) fn req_num(&self) -> Option<f32> {
+        self.req_num
+    }
+
+    /// The words of one query that a post title has to contain (stop words dropped, acronyms
+    /// expanded — the acronym query and the full-name query then demand the same words).
+    pub(crate) fn query_words(&self, q: &str) -> Vec<String> {
+        self.expander.expand(q).to_lowercase().split(' ')
+            .filter(|w| !w.is_empty() && !GC_STOP_WORDS.contains(w))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Whether the post titled `title` passes, for the query whose words are `safe_query_words` and
+    /// whose year anchor is `req_year`.
+    pub(crate) fn is_relevant(&self, title: &str, safe_query_words: &[String], req_year: Option<&str>) -> bool {
+        static RE_WORD_NUM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re_word_num = RE_WORD_NUM.get_or_init(|| regex::Regex::new(r"\d+(?:\.\d+)?").unwrap());
+        let title_lower = title.to_lowercase();
+        // Series-word comparisons (required words, off-series guard) read the acronym-expanded title.
+        let title_cmp = self.expander.expand(&title_lower);
+        let mut is_relevant = true;
+
+        // Pack-SHAPED title: bundle keyword, or a multi-issue/volume RANGE ("#0 – 9",
+        // "Vol. 1 – 4") — GetComics bundles older runs as ranges with no pack KEYWORD.
+        // Computed pre-year-check for the #202 series-year anchor; ACCEPTANCE as a pack
+        // still requires allow_bulk_packs below.
+        let is_pack_shaped = GC_PACK_TERMS.iter().any(|t| title_lower.contains(t))
+            || parse_issue_range(&title_lower).is_some();
+
+        // --- BASELINE FILTERS (both automated and interactive, beta.035) ---
+
+        // 1. Enforce the core series name: every significant query word must appear. For a
+        // single-issue request only the series name (words before the issue number) is
+        // enforced, so a subtitle GetComics omitted doesn't fail an otherwise-correct match.
+        {
+            let mut words_to_enforce: Vec<String> = if self.req_num.is_some() && !self.is_looking_for_omnibus {
+                safe_query_words.to_vec()
+            } else {
+                self.original_query_words.clone()
+            };
+            if self.req_num.is_some() && !self.is_looking_for_omnibus {
+                if let Some(idx) = safe_query_words.iter().position(|w| {
+                    re_word_num.find(w).and_then(|m| m.as_str().parse::<f32>().ok()) == self.req_num
+                }) {
+                    words_to_enforce = safe_query_words[..idx].to_vec();
+                }
+            }
+            for w in &words_to_enforce {
+                if !w.chars().all(char::is_numeric) && !title_cmp.contains(w.as_str()) {
+                    is_relevant = false;
+                    break;
+                }
+            }
+        }
+
+        // 2. Enforce the release year (±1 variance between ComicVine and uploaders).
+        // #202: automated pack-shaped candidates anchor on the SERIES year (fallback:
+        // request year), per-CANDIDATE — a pack can surface from a numbered query whose
+        // req_year is the per-issue release year, which is exactly how "Batman '66
+        // (Collection) (2013-2018)" passed ±1 against 2012-2014 issues of Batman (2011).
+        // Singles keep the per-issue anchor (the long-running-series release-year override
+        // is untouched); interactive keeps the old per-request anchor (humans pick).
+        if is_relevant {
+            let anchor_year = if self.is_interactive {
+                req_year.map(str::to_string)
+            } else {
+                crate::search_engine::pack_anchor_year(is_pack_shaped, self.series_year.as_deref(), req_year)
+            };
+            if let Some(ry) = &anchor_year {
+                if let Some(ty) = crate::search_engine::find_title_year(&title_lower) {
+                    if let (Ok(ryn), Ok(tyn)) = (ry.parse::<i32>(), ty.parse::<i32>()) {
+                        if (ryn - tyn).abs() > 1 { is_relevant = false; }
+                    }
+                }
+            }
+        }
+
+        // --- STRICT AUTOMATION-ONLY FILTERS ---
+        if !self.is_interactive && is_relevant {
+            // Pack ACCEPTANCE = pack-shaped + bulk enabled (shape computed above so the
+            // year anchor could use it; ranges count so volume-batches aren't rejected as
+            // unwanted TPBs).
+            let is_pack = self.allow_bulk_packs && is_pack_shaped;
+
+            // TPB guard: reject collected editions when a single issue was requested.
+            if self.req_num.is_some() && !self.is_looking_for_omnibus && !is_pack {
+                let has_unexpected_tpb = Self::tpb_terms(self.is_manga).iter()
+                    .any(|t| !self.clean_original.contains(*t) && title_lower.contains(*t));
+                if has_unexpected_tpb { is_relevant = false; }
+            }
+
+            // Variant guard (only when the user didn't ask for a variant).
+            if is_relevant
+                && !self.user_wants_variant
+                && (GC_OPEN_VARIANT_KEYWORDS.iter().any(|k| title_lower.contains(k))
+                    || crate::search_engine::matches_bounded_variant(&title_lower))
+            {
+                is_relevant = false;
+            }
+
+            // Issue-number guard.
+            if is_relevant && !self.is_looking_for_omnibus && !is_pack {
+                if let Some(rn) = &self.req_num {
+                    match &crate::search_engine::extract_title_number(&title_lower, self.is_manga) {
+                        Some(tn) if tn != rn => is_relevant = false,
+                        None => is_relevant = false,
+                        _ => {}
+                    }
+                }
+            }
+
+            // OFF-SERIES REVERSE GUARD: GetComics' site search is fuzzy, so "Wolverine #1"
+            // returns sibling series too ("Savage Wolverine #1" — field incident: a 2025
+            // facsimile of it auto-downloaded for the 2024 Wolverine series; the required-
+            // word check only catches MISSING words and the ±1 year guard was defeated by
+            // the reprint year). Reject a single-issue post whose core series words include
+            // one the request lacks — same guard Prowlarr has run since beta.068. #202:
+            // packs are no longer blanket-exempt — they run the pack variant, which allows
+            // bundle vocabulary and numerics but still rejects foreign words ("Arkham City
+            // Game Spin-Offs"). Interactive search never reaches this block, so manual
+            // picks stay unrestricted.
+            if is_relevant && self.req_num.is_some() && !self.reverse_guard_words.is_empty() {
+                if !is_pack {
+                    let extra = crate::search_engine::off_series_extra_words(&title_cmp, &self.reverse_guard_words);
+                    if !extra.is_empty() {
+                        log::debug!("[GetComics Debug] Discarding off-series post \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, self.clean_original);
+                        is_relevant = false;
+                    }
+                } else {
+                    let extra = crate::search_engine::off_series_pack_extra_words(&title_cmp, &self.reverse_guard_words);
+                    if !extra.is_empty() {
+                        log::debug!("[GetComics Debug] Discarding off-series PACK \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, self.clean_original);
+                        is_relevant = false;
+                    }
+                }
+            }
+
+            // Annual guard.
+            if is_relevant && !self.is_looking_for_annual && title_lower.contains("annual") {
+                is_relevant = false;
+            }
+        }
+
+        is_relevant
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn search(
     db: &sqlx::AnyPool,
@@ -554,6 +791,7 @@ pub async fn search(
     series_year: Option<&str>,
     is_manga: bool,
     allow_packs_override: Option<bool>,
+    acronyms: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<ProwlarrResult>> {
     let ddl_enabled: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'ddl_enabled'"#).fetch_optional(db).await?;
     if ddl_enabled.as_deref() == Some("false") { return Ok(vec![]); }
@@ -578,38 +816,8 @@ pub async fn search(
     let article_sel = Selector::parse("article, .post").unwrap();
     let a_sel = Selector::parse("h1.post-title a, h2.post-title a, h1 a, h2 a, .post-header a").unwrap();
 
-    // ---- Query context derived from the ORIGINAL name (parity with performSearch's cleanOriginal). ----
-    // Normalize first ("#1: Book One" -> "#1", "….cbz" -> "…"): otherwise a subtitle keyword like "Book"
-    // flips this single-issue request into omnibus mode, and a leaked file extension ("cbz") or subtitle
-    // word gets enforced as a required title word — rejecting every real single-issue file.
-    let core_original = crate::search_engine::normalize_request_name(original_name);
-    let clean_original = core_original.replace([':', '-', '&'], " ")
-        .split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase();
-    let stop_words: HashSet<&str> = ["the", "a", "an", "of", "and", "or", "vol", "volume", "issue", "black", "white", "blood"].into_iter().collect();
-    let open_variant_keywords = ["variant", "special edition", "director's cut", "directors cut", "facsimile", "black and white", "extended"];
-    let bounded_variant_keywords = ["noir", "b&w", "sketch", "blank", "virgin", "uncut"];
-    let user_wants_variant = bounded_variant_keywords.iter().any(|k| clean_original.contains(k))
-        || open_variant_keywords.iter().any(|k| clean_original.contains(k));
-
-    let req_num = crate::search_engine::extract_number(&clean_original, is_manga, false);
-
-    let mut tpb_terms: Vec<&str> = vec!["omnibus", "tpb", "compendium", "collection", "hc", "hardcover", "trade paperback"];
-    if !is_manga { tpb_terms.extend_from_slice(&["vol ", "volume ", "book "]); }
-    let pack_terms = ["story arc", "pack", "complete", "collection", "bundle", "run", "chronological"];
-    let is_looking_for_omnibus = tpb_terms.iter().any(|t| clean_original.contains(t));
-    let is_looking_for_annual = clean_original.contains("annual");
-
-    let original_query_words: Vec<String> = clean_original.chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .filter(|&w| !stop_words.contains(w))
-        .map(|s| s.to_string())
-        .collect();
-
-    // Reverse-guard request words (#202): numeric-inclusive, built by the SAME pipeline as the
-    // release-title side (lock-step with filter_and_score's reverse_guard_words).
-    let reverse_guard_words = crate::search_engine::guard_query_words(&clean_original);
+    // Everything this search knows about the request, for judging each post (see PostFilter).
+    let post_filter = PostFilter::new(original_name, is_interactive, is_manga, allow_bulk_packs, series_year, acronyms);
 
     // Interactive: fan each incoming query out into the upstream variant set (+ a de-padded form so a
     // "003" request still matches GetComics' "#3" post titles). See interactive_query_variants.
@@ -635,10 +843,7 @@ pub async fn search(
         let q_stripped = re_pad.replace_all(q, "$1").into_owned();
         let q = &q_stripped;
         log::info!("[GetComics] Searching for: \"{}\"", q);
-        let safe_query_words: Vec<String> = q.to_lowercase().split(' ')
-            .filter(|&w| !w.is_empty() && !stop_words.contains(w))
-            .map(|s| s.to_string())
-            .collect();
+        let safe_query_words = post_filter.query_words(q);
 
         // A query targets a SPECIFIC issue when it carries an issue marker OR any bare non-year digit.
         // The query builder strips the '#', so a plain "Wolverine 22" has no marker but IS an issue query
@@ -649,7 +854,7 @@ pub async fn search(
         let targets_issue =
             re_issue_marker.is_match(q) || re_word_num.is_match(&re_year.replace_all(q, " "));
         let active_year = if targets_issue { dynamic_year } else { series_year };
-        let req_year: Option<String> = crate::search_engine::find_title_year(&clean_original)
+        let req_year: Option<String> = crate::search_engine::find_title_year(post_filter.clean_original())
             .or_else(|| active_year.map(|s| s.to_string()));
 
         let mut q_results: Vec<ProwlarrResult> = Vec::new();
@@ -686,131 +891,7 @@ pub async fn search(
             };
 
             for (title, link, size) in posts_data {
-                let title_lower = title.to_lowercase();
-                let mut is_relevant = true;
-
-                // Pack-SHAPED title: bundle keyword, or a multi-issue/volume RANGE ("#0 – 9",
-                // "Vol. 1 – 4") — GetComics bundles older runs as ranges with no pack KEYWORD.
-                // Computed pre-year-check for the #202 series-year anchor; ACCEPTANCE as a pack
-                // still requires allow_bulk_packs below.
-                let is_pack_shaped = pack_terms.iter().any(|t| title_lower.contains(t))
-                    || parse_issue_range(&title_lower).is_some();
-
-                // --- BASELINE FILTERS (both automated and interactive, beta.035) ---
-
-                // 1. Enforce the core series name: every significant query word must appear. For a
-                // single-issue request only the series name (words before the issue number) is
-                // enforced, so a subtitle GetComics omitted doesn't fail an otherwise-correct match.
-                {
-                    let mut words_to_enforce: Vec<String> = if req_num.is_some() && !is_looking_for_omnibus {
-                        safe_query_words.clone()
-                    } else {
-                        original_query_words.clone()
-                    };
-                    if req_num.is_some() && !is_looking_for_omnibus {
-                        if let Some(idx) = safe_query_words.iter().position(|w| {
-                            re_word_num.find(w).and_then(|m| m.as_str().parse::<f32>().ok()) == req_num
-                        }) {
-                            words_to_enforce = safe_query_words[..idx].to_vec();
-                        }
-                    }
-                    for w in &words_to_enforce {
-                        if !w.chars().all(char::is_numeric) && !title_lower.contains(w) {
-                            is_relevant = false;
-                            break;
-                        }
-                    }
-                }
-
-                // 2. Enforce the release year (±1 variance between ComicVine and uploaders).
-                // #202: automated pack-shaped candidates anchor on the SERIES year (fallback:
-                // request year), per-CANDIDATE — a pack can surface from a numbered query whose
-                // req_year is the per-issue release year, which is exactly how "Batman '66
-                // (Collection) (2013-2018)" passed ±1 against 2012-2014 issues of Batman (2011).
-                // Singles keep the per-issue anchor (the long-running-series release-year override
-                // is untouched); interactive keeps the old per-request anchor (humans pick).
-                if is_relevant {
-                    let anchor_year = if is_interactive {
-                        req_year.clone()
-                    } else {
-                        crate::search_engine::pack_anchor_year(is_pack_shaped, series_year, req_year.as_deref())
-                    };
-                    if let Some(ry) = &anchor_year {
-                        if let Some(ty) = crate::search_engine::find_title_year(&title_lower) {
-                            if let (Ok(ryn), Ok(tyn)) = (ry.parse::<i32>(), ty.parse::<i32>()) {
-                                if (ryn - tyn).abs() > 1 { is_relevant = false; }
-                            }
-                        }
-                    }
-                }
-
-                // --- STRICT AUTOMATION-ONLY FILTERS ---
-                if !is_interactive && is_relevant {
-                    // Pack ACCEPTANCE = pack-shaped + bulk enabled (shape computed above so the
-                    // year anchor could use it; ranges count so volume-batches aren't rejected as
-                    // unwanted TPBs).
-                    let is_pack = allow_bulk_packs && is_pack_shaped;
-
-                    // TPB guard: reject collected editions when a single issue was requested.
-                    if req_num.is_some() && !is_looking_for_omnibus && !is_pack {
-                        let has_unexpected_tpb = tpb_terms.iter()
-                            .any(|t| !clean_original.contains(*t) && title_lower.contains(*t));
-                        if has_unexpected_tpb { is_relevant = false; }
-                    }
-
-                    // Variant guard (only when the user didn't ask for a variant).
-                    if is_relevant
-                        && !user_wants_variant
-                        && (open_variant_keywords.iter().any(|k| title_lower.contains(k))
-                            || crate::search_engine::matches_bounded_variant(&title_lower))
-                    {
-                        is_relevant = false;
-                    }
-
-                    // Issue-number guard.
-                    if is_relevant && !is_looking_for_omnibus && !is_pack {
-                        if let Some(rn) = &req_num {
-                            match &crate::search_engine::extract_title_number(&title_lower, is_manga) {
-                                Some(tn) if tn != rn => is_relevant = false,
-                                None => is_relevant = false,
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    // OFF-SERIES REVERSE GUARD: GetComics' site search is fuzzy, so "Wolverine #1"
-                    // returns sibling series too ("Savage Wolverine #1" — field incident: a 2025
-                    // facsimile of it auto-downloaded for the 2024 Wolverine series; the required-
-                    // word check only catches MISSING words and the ±1 year guard was defeated by
-                    // the reprint year). Reject a single-issue post whose core series words include
-                    // one the request lacks — same guard Prowlarr has run since beta.068. #202:
-                    // packs are no longer blanket-exempt — they run the pack variant, which allows
-                    // bundle vocabulary and numerics but still rejects foreign words ("Arkham City
-                    // Game Spin-Offs"). Interactive search never reaches this block, so manual
-                    // picks stay unrestricted.
-                    if is_relevant && req_num.is_some() && !reverse_guard_words.is_empty() {
-                        if !is_pack {
-                            let extra = crate::search_engine::off_series_extra_words(&title_lower, &reverse_guard_words);
-                            if !extra.is_empty() {
-                                log::debug!("[GetComics Debug] Discarding off-series post \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, clean_original);
-                                is_relevant = false;
-                            }
-                        } else {
-                            let extra = crate::search_engine::off_series_pack_extra_words(&title_lower, &reverse_guard_words);
-                            if !extra.is_empty() {
-                                log::debug!("[GetComics Debug] Discarding off-series PACK \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, clean_original);
-                                is_relevant = false;
-                            }
-                        }
-                    }
-
-                    // Annual guard.
-                    if is_relevant && !is_looking_for_annual && title_lower.contains("annual") {
-                        is_relevant = false;
-                    }
-                }
-
-                if is_relevant {
+                if post_filter.is_relevant(&title, &safe_query_words, req_year.as_deref()) {
                     q_results.push(ProwlarrResult {
                         guid: link.clone(), title, size, indexer: "GetComics".to_string(),
                         seeders: 100, peers: 0, info_url: link.clone(), download_url: link,
@@ -857,9 +938,10 @@ pub async fn search(
     // sort only orders within one query, and the name-only broad variant injects other issues, so the
     // exact match would otherwise be buried among "Wolverine #1/#2/#4…" posts.
     if is_interactive {
-        let sort_year = crate::search_engine::find_title_year(&clean_original)
+        let sort_year = crate::search_engine::find_title_year(post_filter.clean_original())
             .or_else(|| series_year.map(|s| s.to_string()))
             .or_else(|| dynamic_year.map(|s| s.to_string()));
+        let req_num = post_filter.req_num();
         results.sort_by(|a, b| {
             if let Some(rn) = req_num {
                 let am = crate::search_engine::extract_title_number(&a.title.to_lowercase(), is_manga) == Some(rn);
@@ -1720,5 +1802,88 @@ mod tests {
         migrate_legacy_getcomics(&mut prefs);
         let after: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
         assert_eq!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod post_filter_tests {
+    // ==== The per-post relevance rules (PostFilter), and acronyms on both sides of them. A request
+    // for "TMNT: The Last Ronin #1" searched GetComics with the expanded "teenage mutant ninja turtles"
+    // query and found "Teenage Mutant Ninja Turtles - The Last Ronin #1" - then the off-series guard,
+    // built from the request's own words ("tmnt last ronin 1"), counted teenage/mutant/ninja/turtles
+    // as foreign series words and threw the right post away.
+    use super::*;
+
+    fn tmnt() -> HashMap<String, String> {
+        HashMap::from([("tmnt".to_string(), "teenage mutant ninja turtles".to_string())])
+    }
+
+    /// An automated (strict) filter for `name`, judging `title` under the query `query`.
+    fn relevant(name: &str, query: &str, title: &str, acronyms: &HashMap<String, String>) -> bool {
+        let filter = PostFilter::new(name, false, false, false, Some("2020"), acronyms);
+        let words = filter.query_words(query);
+        filter.is_relevant(title, &words, Some("2020"))
+    }
+
+    // Characterization: the guards the loop always ran, unchanged by the move into PostFilter.
+    #[test]
+    fn keeps_the_requested_series_and_rejects_a_sibling_one() {
+        let none = HashMap::new();
+        assert!(relevant("Wolverine #1", "Wolverine 1", "Wolverine #1 (2020)", &none));
+        assert!(!relevant("Wolverine #1", "Wolverine 1", "Savage Wolverine #1 (2020)", &none), "off-series guard");
+        assert!(!relevant("Wolverine #1", "Wolverine 1", "Wolverine #2 (2020)", &none), "issue-number guard");
+        assert!(!relevant("Wolverine #1", "Wolverine 1", "Wolverine #1 (2014)", &none), "year guard");
+    }
+
+    #[test]
+    fn an_acronym_request_accepts_the_post_that_spells_the_name_out() {
+        let title = "Teenage Mutant Ninja Turtles - The Last Ronin #1 (2020)";
+        assert!(relevant("TMNT: The Last Ronin #1", "teenage mutant ninja turtles The Last Ronin 1", title, &tmnt()));
+        assert!(relevant("TMNT: The Last Ronin #1", "TMNT The Last Ronin 1", title, &tmnt()));
+    }
+
+    #[test]
+    fn a_spelled_out_request_accepts_the_post_that_uses_the_acronym() {
+        assert!(relevant(
+            "Teenage Mutant Ninja Turtles: The Last Ronin #1",
+            "Teenage Mutant Ninja Turtles The Last Ronin 1",
+            "TMNT: The Last Ronin #1 (2020)",
+            &tmnt(),
+        ));
+    }
+
+    #[test]
+    fn the_acronym_never_lets_a_sibling_series_through() {
+        // Same acronym, different series: still foreign words after expansion on both sides.
+        assert!(!relevant("TMNT: The Last Ronin #1", "TMNT The Last Ronin 1", "TMNT: Saturday Morning Adventures #1 (2020)", &tmnt()));
+        assert!(!relevant(
+            "TMNT: The Last Ronin #1",
+            "teenage mutant ninja turtles The Last Ronin 1",
+            "Teenage Mutant Ninja Turtles #1 (2020)",
+            &tmnt(),
+        ), "the main series lacks the subtitle words");
+    }
+
+    #[test]
+    fn an_acronym_request_without_an_issue_number_enforces_the_spelled_out_words() {
+        let title = "Teenage Mutant Ninja Turtles - The Last Ronin (2020)";
+        assert!(relevant("TMNT: The Last Ronin", "teenage mutant ninja turtles The Last Ronin", title, &tmnt()));
+    }
+
+    #[test]
+    fn packs_match_across_the_acronym_both_ways() {
+        let filter = PostFilter::new("TMNT: The Last Ronin #1", false, false, true, Some("2020"), &tmnt());
+        let words = filter.query_words("TMNT The Last Ronin 1");
+        assert!(filter.is_relevant("Teenage Mutant Ninja Turtles - The Last Ronin #1-5 (2020)", &words, Some("2020")));
+
+        let filter = PostFilter::new("Teenage Mutant Ninja Turtles: The Last Ronin #1", false, false, true, Some("2020"), &tmnt());
+        let words = filter.query_words("Teenage Mutant Ninja Turtles The Last Ronin 1");
+        assert!(filter.is_relevant("TMNT - The Last Ronin #1-5 (2020)", &words, Some("2020")));
+    }
+
+    #[test]
+    fn without_the_acronym_table_nothing_is_expanded() {
+        let title = "Teenage Mutant Ninja Turtles - The Last Ronin #1 (2020)";
+        assert!(!relevant("TMNT: The Last Ronin #1", "TMNT The Last Ronin 1", title, &HashMap::new()));
     }
 }

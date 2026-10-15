@@ -1407,7 +1407,7 @@ async fn handle_search(
     // downloadable match.
     let (get_res_raw, annas_res_raw, prow_res_raw) = tokio::join!(
         async { if run_get {
-            getcomics::search(&state.db.pool, &state.limiter, &queries, false, &payload.name, req_year.as_deref(), series_year.as_deref(), is_manga, Some(use_packs)).await
+            getcomics::search(&state.db.pool, &state.limiter, &queries, false, &payload.name, req_year.as_deref(), series_year.as_deref(), is_manga, Some(use_packs), &acronyms).await
         } else { Ok::<Vec<prowlarr::ProwlarrResult>, anyhow::Error>(Vec::new()) } },
         async { if run_annas {
             annas_archive::search(&state.db.pool, &state.limiter, &queries, false, is_manga).await
@@ -1466,7 +1466,7 @@ async fn handle_search(
                 // GetComics results are already relevance-filtered in getcomics::search → operator
                 // junk/exclude lists + scoring only (skip_relevance = true).
                 if let Ok(Some(mut best_ddl)) = search_engine::filter_and_score(
-                    &state.db.pool, get_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), true, Some(use_packs)
+                    &state.db.pool, get_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), true, Some(use_packs), &acronyms
                 ).await {
                     // Resolve the article to concrete hoster links; scrape_deep_link drops disabled
                     // hosters, so an empty list means no enabled hoster can serve this match.
@@ -1511,7 +1511,7 @@ async fn handle_search(
                 if annas_res.is_empty() { continue; }
                 // Anna's Archive results aren't pre-filtered (unlike GetComics) → full relevance scoring.
                 if let Ok(Some(mut best_aa)) = search_engine::filter_and_score(
-                    &state.db.pool, annas_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs)
+                    &state.db.pool, annas_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs), &acronyms
                 ).await {
                     // The result's download_url is already the resolvable /md5/ link — emit one candidate
                     // tagged for the existing Node resolver (premium key → stream; keyless → MANUAL_DDL).
@@ -1525,7 +1525,7 @@ async fn handle_search(
             "prowlarr" => {
                 if prow_res.is_empty() { continue; }
                 if let Ok(Some(best_prow)) = search_engine::filter_and_score(
-                    &state.db.pool, prow_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs)
+                    &state.db.pool, prow_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs), &acronyms
                 ).await {
                     log::info!("[Prowlarr] Matched an indexer release for {}.", payload.name);
                     best_match = Some(best_prow);
@@ -1570,6 +1570,9 @@ async fn handle_interactive_search(
     log::info!("[Interactive] Prowlarr query ladder ({} rung(s)): {:?}", ladder.len(), ladder);
     let queries = vec![payload.query.clone()];
     let is_manga = payload.is_manga.unwrap_or(false);
+    // The GetComics filter compares acronym-expanded words on both sides ("TMNT" vs "Teenage
+    // Mutant Ninja Turtles"), interactive included.
+    let acronyms = search_engine::get_custom_acronyms(&state.db.pool).await.unwrap_or_default();
 
     // Anna's Archive is key-free for interactive search but OFF by default — only query it when the
     // admin has opted in. The empty-on-disabled future keeps all three sources in one concurrent join.
@@ -1577,7 +1580,7 @@ async fn handle_interactive_search(
 
     let (prow_res, get_res, annas_res) = tokio::join!(
         prowlarr::search(&state.db.pool, &state.limiter, &ladder, is_manga, false),
-        getcomics::search(&state.db.pool, &state.limiter, &queries, true, &payload.query, payload.year.as_deref(), payload.year.as_deref(), is_manga, None),
+        getcomics::search(&state.db.pool, &state.limiter, &queries, true, &payload.query, payload.year.as_deref(), payload.year.as_deref(), is_manga, None, &acronyms),
         async {
             if annas_enabled {
                 annas_archive::search(&state.db.pool, &state.limiter, &queries, true, is_manga).await
