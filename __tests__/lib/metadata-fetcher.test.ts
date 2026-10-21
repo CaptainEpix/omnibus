@@ -398,6 +398,59 @@ describe('Metadata Pipeline: ComicVine Sync Engine', () => {
         expect(mocks.creditDeleteMany).not.toHaveBeenCalled();
     });
 
+    // Review of #232 (#251 beta): the "has a file" half of the release-date guard was untested.
+    it("with file priority on, keeps a filed issue's own release date and moves a placeholder's", async () => {
+        mocks.systemSettingFindUnique.mockImplementation(async ({ where }: { where: { key: string } }) =>
+            where.key === 'file_metadata_priority' ? { value: 'true' } : { value: 'mock_api_key' });
+        mocks.issueFindMany.mockResolvedValue([
+            { id: 'r1', number: '1', metadataId: '901', matchState: 'MATCHED', hasCustomMetadata: false,
+              filePath: '/comics/Batman/Batman #001.cbz', releaseDate: '2016-06-30' },
+            { id: 'r2', number: '2', metadataId: '902', matchState: 'MATCHED', hasCustomMetadata: false,
+              filePath: null, releaseDate: '2016-07-01' },
+        ]);
+        mocks.axiosGet.mockImplementation(async (url: string) => {
+            if (url.includes('/volume/')) {
+                return { data: { results: { name: 'Batman', start_year: '2016', publisher: { name: 'DC Comics' }, image: null } } };
+            }
+            if (url.includes('/issues/')) {
+                return { data: { number_of_total_results: 2, results: [
+                    { id: 901, issue_number: '1', name: 'One', store_date: '2016-06-01' },
+                    { id: 902, issue_number: '2', name: 'Two', store_date: '2016-07-27' },
+                ] } };
+            }
+            return { data: Buffer.from('img') };
+        });
+        mocks.existsSync.mockReturnValue(false);
+
+        await syncSeriesMetadata('123', '/comics/Batman', 'COMICVINE');
+
+        const updates = mocks.issueUpdate.mock.calls.map(c => c[0]);
+        expect(updates.find(u => u.where.id === 'r1').data.releaseDate).toBe('2016-06-30');
+        // A WANTED placeholder takes the store date, so a delayed issue moves on the calendar.
+        expect(updates.find(u => u.where.id === 'r2').data.releaseDate).toBe('2016-07-27');
+    });
+
+    // #251: following a series ran this sync, which always queued an embed - "Write metadata to
+    // ComicInfo.xml" only held back the Edit Metadata dialog.
+    it('with ComicInfo writing off, queues the series.json export instead of an embed', async () => {
+        mocks.systemSettingFindUnique.mockImplementation(async ({ where }: { where: { key: string } }) =>
+            where.key === 'metadata_write_comicinfo' ? { value: 'false' } : { value: 'mock_api_key' });
+        mocks.axiosGet.mockImplementation(async (url: string) => {
+            if (url.includes('/volume/')) {
+                return { data: { results: { name: 'Batman', start_year: '2016', publisher: { name: 'DC Comics' }, image: null } } };
+            }
+            return { data: { number_of_total_results: 0, results: [] } };
+        });
+        mocks.existsSync.mockReturnValue(false);
+
+        const result = await syncSeriesMetadata('123', '/comics/Batman', 'COMICVINE');
+
+        expect(result.success).toBe(true);
+        expect(mocks.queueAdd).not.toHaveBeenCalledWith('EMBED_METADATA', expect.anything(), expect.anything());
+        expect(mocks.queueAdd).toHaveBeenCalledWith('EXPORT_SERIES_JSON',
+            { type: 'EXPORT_SERIES_JSON', seriesId: 'series_1' }, expect.objectContaining({ delay: 300000 }));
+    });
+
     it('isCvRateLimited treats ComicVine\'s 420 velocity block the same as a 429', () => {
         expect(isCvRateLimited(429)).toBe(true);
         expect(isCvRateLimited(420)).toBe(true);

@@ -6,6 +6,7 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { omnibusQueue } from '@/lib/queue';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
+import { resolveWriteToFile } from '@/lib/comicinfo-writes';
 
 export async function PUT(request: Request) {
     const authOptions = await getAuthOptions();
@@ -13,7 +14,7 @@ export async function PUT(request: Request) {
     if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
 
     try {
-        const { updates, action } = await request.json(); 
+        const { updates, action, writeToFile } = await request.json();
         
         if (action === 'restore') {
             // Restore defaults: Unset the flag
@@ -46,8 +47,9 @@ export async function PUT(request: Request) {
             updates: updates.map((u: any) => ({ id: u.id, name: u.name, number: u.number }))
         }, (session.user as any).id);
 
-        if (updates.length > 0) {
-            await omnibusQueue.add('EMBED_METADATA', { 
+        // #251: the same rule as a single-issue edit - its own toggle wins, otherwise the setting.
+        if (updates.length > 0 && await resolveWriteToFile(writeToFile)) {
+            await omnibusQueue.add('EMBED_METADATA', {
                 type: 'EMBED_METADATA', 
                 issueIds: updates.map((u: any) => u.id) 
             }, {

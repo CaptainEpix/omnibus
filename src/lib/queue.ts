@@ -16,6 +16,7 @@ import { issueNumberOf, settleDuplicateOnLink } from '@/lib/request-dedupe';
 import { processPageSweepChunk } from '@/lib/pages/page-sweep';
 import { SCHEDULE_SEED_KEY, newScheduleSeed, scheduleOffsetMs } from '@/lib/schedule-jitter';
 import { SCHEDULE_KEYS, scheduleValue } from '@/lib/schedule-defaults';
+import { comicInfoWritesEnabled } from '@/lib/comicinfo-writes';
 
 function isNewerVersion(latest: string, current: string): boolean {
     const cleanLatest = latest.replace(/^v/, '');
@@ -792,7 +793,10 @@ export function initWorker() {
                             body: JSON.stringify({
                                 series_ids: isTargeted ? job.data.seriesIds : null,
                                 // A yes to a series' Refresh Metadata per-issue credits ask (Metron beta 4).
-                                ...(isTargeted && job.data.fetchCredits === true ? { fetch_credits: true } : {})
+                                ...(isTargeted && job.data.fetchCredits === true ? { fetch_credits: true } : {}),
+                                // #251: the Smart Matcher's "Write to file" choice outranks the setting for this
+                                // sync's embed; without one, the engine follows metadata_write_comicinfo.
+                                ...(typeof job.data.writeComicInfo === 'boolean' ? { write_comicinfo: job.data.writeComicInfo } : {})
                             })
                         });
 
@@ -812,9 +816,25 @@ export function initWorker() {
 
                                 case 'EMBED_METADATA': {
                     const { seriesId, issueIds } = job.data;
-                    
+                    const isBulk = !seriesId && (!issueIds || issueIds.length === 0);
+
+                    // #251: the scheduled embed (and its Run Now) rewrites every archive in the library -
+                    // with "Write metadata to ComicInfo.xml" off it never runs. A targeted embed is an
+                    // edit's own write-to-file choice (or an automatic one already checked) and goes ahead.
+                    if (isBulk && !(await comicInfoWritesEnabled())) {
+                        await prisma.jobLog.create({
+                            data: {
+                                jobType: 'EMBED_METADATA',
+                                status: 'COMPLETED_WITH_ERRORS',
+                                durationMs: Date.now() - startTime,
+                                message: 'Skipped: writing metadata to ComicInfo.xml is turned off. Enable it in Settings → Metadata.'
+                            }
+                        });
+                        break;
+                    }
+
                     // Only update the global timer if this was a scheduled bulk job
-                    if (!seriesId && (!issueIds || issueIds.length === 0)) {
+                    if (isBulk) {
                         await prisma.systemSetting.upsert({ 
                             where: { key: 'last_embed_sync' }, 
                             update: { value: nowStr }, 

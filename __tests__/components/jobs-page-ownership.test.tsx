@@ -8,7 +8,7 @@
 // and its save payload contains schedules ONLY.
 import '@testing-library/jest-dom';
 import React from 'react';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ScheduledJobsPage from '@/app/admin/jobs/page';
 import { SCHEDULE_DEFAULTS } from '@/lib/schedule-defaults';
@@ -85,6 +85,36 @@ describe('Jobs page: schedule-only ownership (Phase 3)', () => {
             expect(body.settings).toHaveProperty('cbr_conversion_schedule');
             expect(body.settings).not.toHaveProperty('cbr_conversion_enabled');
         });
+    });
+});
+
+// #251: with "Write metadata to ComicInfo.xml" off the scheduled embed never runs, so its card says
+// why and where to change it, and its Run Now is off too (the series.json card's pattern).
+describe('Jobs page: the embed card while ComicInfo writing is off', () => {
+    const withSetting = (settings: { key: string, value: string }[]) =>
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            if (url === '/api/admin/config' && (!init || !init.method || init.method === 'GET')) {
+                return configResponse(settings);
+            }
+            return { ok: true, json: async () => ({}) };
+        });
+
+    it('notes that the schedule won\'t run, links to Settings and disables Run Now', async () => {
+        withSetting([{ key: 'metadata_write_comicinfo', value: 'false' }]);
+        render(<ScheduledJobsPage />);
+
+        const note = await screen.findByText(/ComicInfo\.xml writing is turned off/i);
+        const card = note.closest('div')!;
+        expect(within(card).getByRole('link', { name: /Settings.*Metadata/i })).toHaveAttribute('href', expect.stringContaining('/admin/settings'));
+        expect(within(card).getByRole('button', { name: /Run Now/i })).toBeDisabled();
+    });
+
+    it('shows no note at the default (writing on)', async () => {
+        withSetting([]);
+        render(<ScheduledJobsPage />);
+
+        await screen.findByText(/Embed XML Metadata/i);
+        await waitFor(() => expect(screen.queryByText(/ComicInfo\.xml writing is turned off/i)).not.toBeInTheDocument());
     });
 });
 

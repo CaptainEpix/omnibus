@@ -7,6 +7,7 @@ import { revalidatePath, revalidateTag } from 'next/cache';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { omnibusQueue } from '@/lib/queue';
+import { resolveWriteToFile } from '@/lib/comicinfo-writes';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { AuditLogger } from '@/lib/audit-logger';
@@ -200,12 +201,7 @@ export async function POST(request: Request) {
 
         // Embed manual changes into the files' ComicInfo.xml — unless the admin chose "keep in
         // Omnibus". The per-edit toggle (writeToFile) wins; otherwise the global default applies.
-        let doWrite = writeToFile;
-        if (doWrite === undefined) {
-            const writeSetting = await prisma.systemSetting.findUnique({ where: { key: 'metadata_write_comicinfo' } });
-            doWrite = writeSetting?.value !== 'false'; // default: write
-        }
-        if (doWrite) {
+        if (await resolveWriteToFile(writeToFile)) {
             try {
                 await omnibusQueue.add('EMBED_METADATA', { type: 'EMBED_METADATA', seriesId: existingRecord.id }, {
                     jobId: `EMBED_META_${existingRecord.id}_${Date.now()}`

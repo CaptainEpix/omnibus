@@ -16,6 +16,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { omnibusQueue } from '@/lib/queue';
+import { comicInfoWritesEnabled } from '@/lib/comicinfo-writes';
 import fs from 'fs';
 import { randomUUID } from 'crypto';
 import { UNMATCHED_DIR, isPathWithinRoots } from '@/lib/utils/paths';
@@ -44,10 +45,12 @@ function queueSeriesJsonExport(seriesId: string, tag: string) {
  * claimed file otherwise keeps the XML it had before the attach — the parent volume's id, the series'
  * year, no issue id — until the series' next refresh, and the attached volume's id in the file is
  * half of the zero-API restore. Same FIRE-AND-FORGET rule as the series.json export, and a failure
- * here never fails the attach: the next refresh rewrites these files anyway.
+ * here never fails the attach: the next refresh rewrites these files anyway. An attach is no
+ * write-to-file choice of its own, so "Write metadata to ComicInfo.xml" decides (#251).
  */
 async function queueLaneEmbed(attachmentId: string) {
     try {
+        if (!(await comicInfoWritesEnabled())) return;
         const rows = await prisma.issue.findMany({
             where: { attachedVolumeId: attachmentId, filePath: { not: null } },
             select: { id: true, filePath: true },

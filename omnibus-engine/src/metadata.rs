@@ -311,11 +311,14 @@ pub(crate) struct SyncOptions {
     /// A person asked, on a series' Refresh Metadata, for its per-issue Metron credits too (the
     /// ask-with-a-count shown while the "per-issue credits" setting is off - Metron beta 4).
     pub fetch_credits: bool,
+    /// #251: an edit's own "write to file" choice for this sync (the Smart Matcher's toggle), which
+    /// outranks the metadata_write_comicinfo setting. None = the setting decides.
+    pub write_comicinfo: Option<bool>,
 }
 
 impl SyncOptions {
     pub(crate) fn for_request(series_ids: &Option<Vec<String>>, fetch_credits: bool) -> Self {
-        SyncOptions { full_fetch: series_ids.is_some(), fetch_credits }
+        SyncOptions { full_fetch: series_ids.is_some(), fetch_credits, write_comicinfo: None }
     }
 }
 
@@ -345,8 +348,9 @@ const DETAIL_PASS_CANDIDATES: &str = r#"SELECT id, "metadataId", number, name, w
              AND "matchState" <> 'DEEP_SYNCED' AND CAST("hasCustomMetadata" AS INTEGER) = 0"#;
 
 /// `fetch_credits`: a person asked for per-issue Metron credits on this refresh (see SyncOptions).
-pub async fn sync_metadata(db: Db, series_ids: Option<Vec<String>>, fetch_credits: bool) -> anyhow::Result<()> {
-    let opts = SyncOptions::for_request(&series_ids, fetch_credits);
+/// `write_comicinfo`: an edit's own write-to-file choice (#251); None = the setting decides.
+pub async fn sync_metadata(db: Db, series_ids: Option<Vec<String>>, fetch_credits: bool, write_comicinfo: Option<bool>) -> anyhow::Result<()> {
+    let opts = SyncOptions { write_comicinfo, ..SyncOptions::for_request(&series_ids, fetch_credits) };
     sync_metadata_attempt(db, series_ids, opts, 0).await
 }
 
@@ -437,6 +441,13 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, opts: Sy
     let file_priority: bool = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'file_metadata_priority'"#)
         .fetch_optional(&db.pool).await.ok().flatten().as_deref() == Some("true");
 
+    // #251: "Write metadata to ComicInfo.xml" (metadata_write_comicinfo, absent = on). Off, a sync
+    // refreshes the database and series.json but never rewrites an archive; an edit's own choice
+    // (the Smart Matcher's toggle, SyncOptions.write_comicinfo) outranks the setting either way.
+    let comicinfo_setting: Option<String> = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'metadata_write_comicinfo'"#)
+        .fetch_optional(&db.pool).await.ok().flatten();
+    let write_comicinfo = crate::metadata_writer::writes_comicinfo(comicinfo_setting.as_deref(), opts.write_comicinfo);
+
     // metron_detail_credits (opt-in, quota-heavy): fetch per-issue credits via Metron detail calls —
     // one /issue/{id}/ call per owned issue still missing them, budgeted against the account's daily
     // window. Off: only when a person asks on the Refresh button (runs_detail_pass).
@@ -526,10 +537,10 @@ async fn sync_metadata_attempt(db: Db, series_ids: Option<Vec<String>>, opts: Sy
         // file is already a row by the time the claim looks for it. Never fatal to the series.
         crate::attached_volumes::sync_series_attachments(&db, &client, &series_id).await;
 
-        // Embed the (now-refreshed) DB values into the archives via the full-tag writer
-        // (unified on metadata_writer::process_embed_job — no more duplicate 4-tag writer).
-        let embed_payload = crate::metadata_writer::EmbedRequest { series_id: Some(series_id.clone()), issue_ids: None };
-        match crate::metadata_writer::process_embed_job(db.clone(), embed_payload).await {
+        // Write the (now-refreshed) DB values into the series' files: the full-tag ComicInfo.xml
+        // embed (unified on metadata_writer::process_embed_job — no more duplicate 4-tag writer),
+        // or series.json alone while ComicInfo writing is off (#251).
+        match crate::metadata_writer::refresh_files_after_sync(&db, &series_id, write_comicinfo).await {
             // FIX (comicinfo-embed-logging): this call's (success, fail, json_count) result used to be
             // discarded entirely on the Ok path -- only the outer Err (a hard query/DB failure) ever
             // got logged, so a batch that ran fine but embedded 0 of N files (e.g. every file's path
@@ -975,7 +986,7 @@ async fn fetch_comicvine(
             // file_metadata_priority: a release date already on the row (read from ComicInfo.xml at scan)
             // is kept; the provider only fills a blank. ComicVine's store date otherwise silently
             // replaces the file's cover date, shifting Month/Day (and Year across a year boundary).
-            let release_val = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority && has_file);
+            let release_val = synced_release_date(existing_release, issue_date.clone(), is_locked, file_priority, has_file);
             // A locked (manually edited) issue keeps its description; file-priority keeps a non-empty
             // ComicInfo-derived one; otherwise take the provider's.
             let desc_val = prefer_existing(existing_desc, cv_desc.clone(), is_locked, file_priority);
@@ -1482,7 +1493,7 @@ async fn fetch_metron(
         // resolver lets them fill blanks but never clobber a real story title that the detail
         // pass (or a ComicInfo read) already landed. Lock + file priority unchanged.
         let name_val: Option<String> = resolve_synced_name(existing_name, Some(issue_name), &issue_num, is_locked, file_priority);
-        let release_val: Option<String> = prefer_existing(existing_release, issue_date.clone(), is_locked, file_priority && has_file);
+        let release_val: Option<String> = synced_release_date(existing_release, issue_date.clone(), is_locked, file_priority, has_file);
         // A custom issue cover (set in the Smart Matcher) survives every sync; else the provider's wins.
         let cover_val: Option<String> = if has_custom_cover { existing_cover } else { issue_cover.clone() };
 
@@ -2038,6 +2049,16 @@ pub(crate) fn merge_credit_json(existing: Option<String>, fetched: &[String], lo
         return existing;
     }
     serde_json::to_string(fetched).ok().or(existing)
+}
+
+/// What a LIST sync writes into Issue.releaseDate (review of #232; both provider paths call it, so
+/// the "has a file" half can't be dropped at one site alone). A locked row keeps its date; with
+/// file_metadata_priority on, a row that HAS a file keeps its non-empty date (the cover date read
+/// from its ComicInfo.xml) and the provider only fills a blank; a row with no file - a WANTED
+/// placeholder - takes the provider's date, so a delayed issue keeps moving on the release
+/// calendar. EXACT twin: src/lib/utils/synced-release-date.ts.
+pub(crate) fn synced_release_date(existing: Option<String>, provider: Option<String>, locked: bool, file_priority: bool, has_file: bool) -> Option<String> {
+    prefer_existing(existing, provider, locked, file_priority && has_file)
 }
 
 /// Narrative-field write policy: locked keeps existing; file_metadata_priority keeps a non-empty
@@ -2952,6 +2973,132 @@ mod tests {
         assert_eq!(retry_options(sweep), sweep);
         let refresh = SyncOptions::for_request(&Some(vec!["s1".into()]), true);
         assert_eq!(retry_options(refresh), refresh);
+        // #251: a halted match's tail keeps the Smart Matcher's write-to-file choice.
+        let kept_in_omnibus = SyncOptions { write_comicinfo: Some(false), ..refresh };
+        assert_eq!(retry_options(kept_in_omnibus).write_comicinfo, Some(false));
+    }
+
+    // Review of #232 (#251 beta): the release-date guard's "has a file" half had no test on either
+    // side - dropping it still passed both suites. It is one policy now, shared by the ComicVine and
+    // Metron paths (Node twin: src/lib/utils/synced-release-date.ts).
+    #[test]
+    fn a_synced_release_date_keeps_a_filed_issues_own_date_but_moves_a_placeholders() {
+        let file_date = || Some("2017-06-30".to_string());
+        let store_date = || Some("2017-04-19".to_string());
+        assert_eq!(synced_release_date(file_date(), store_date(), false, true, true), file_date(),
+            "file priority: the cover date read from the file survives the sync");
+        assert_eq!(synced_release_date(file_date(), store_date(), false, true, false), store_date(),
+            "a placeholder has no file to protect: a delayed issue keeps moving on the calendar");
+        assert_eq!(synced_release_date(None, store_date(), false, true, true), store_date(),
+            "the provider still fills a blank");
+        assert_eq!(synced_release_date(Some("  ".to_string()), store_date(), false, true, true), store_date());
+        assert_eq!(synced_release_date(file_date(), store_date(), false, false, true), store_date(),
+            "file priority off: the provider's date wins, as before");
+        assert_eq!(synced_release_date(file_date(), store_date(), true, false, false), file_date(),
+            "a hand-edited issue keeps its date whatever else holds");
+    }
+
+    // #251: with "Write metadata to ComicInfo.xml" off, only the Edit Metadata dialog held back -
+    // every series sync still rewrote the archives. A LOCAL series skips the provider fetch, so this
+    // drives the real sync end to end with no network: the setting, an edit's own choice, the file
+    // step and the lastMetadataSync bump.
+    #[tokio::test]
+    async fn a_sync_leaves_the_archives_alone_while_comicinfo_writing_is_off() {
+        use std::io::{Read as _, Write as _};
+        let base = std::env::temp_dir().join(format!("omnibus_sync_251_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let folder = base.join("Saga (2012)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let cbz = folder.join("Saga 001.cbz");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&cbz).unwrap());
+            zw.start_file("01.jpg", zip::write::FileOptions::default()).unwrap();
+            zw.write_all(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+            zw.finish().unwrap();
+        }
+        let comicinfo = |p: &std::path::Path| -> Option<String> {
+            let mut za = zip::ZipArchive::new(std::fs::File::open(p).unwrap()).unwrap();
+            let mut entry = za.by_name("ComicInfo.xml").ok()?;
+            let mut xml = String::new();
+            entry.read_to_string(&mut xml).unwrap();
+            Some(xml)
+        };
+
+        let db_file = base.join("sync.db");
+        std::fs::File::create(&db_file).unwrap();
+        let db = Db::connect(&format!("file:{}", db_file.to_string_lossy().replace('\\', "/")), 2)
+            .await.expect("connect file-backed sqlite");
+        // Prisma's own column types where the sync reads them raw-sensitive: DATETIME for the two
+        // timestamps it writes, BOOLEAN flags read through CAST.
+        for ddl in [
+            r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT)"#,
+            r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, publisher TEXT, year INTEGER,
+                "folderPath" TEXT, universe TEXT, "seriesGroup" TEXT, "isManga" BOOLEAN DEFAULT false,
+                "metadataId" TEXT, "metadataSource" TEXT, genres TEXT, description TEXT, status TEXT,
+                "bookType" TEXT, "cvId" INTEGER, "remoteCoverUrl" TEXT, "coverUrl" TEXT, imprint TEXT,
+                "ageRating" TEXT, "seriesJsonWritten" BOOLEAN DEFAULT false,
+                "hasCustomCover" BOOLEAN DEFAULT false, "hasCustomMetadata" BOOLEAN DEFAULT false,
+                "lastMetadataSync" DATETIME, "updatedAt" DATETIME,
+                writers TEXT, artists TEXT, "coverArtists" TEXT, colorists TEXT, letterers TEXT,
+                characters TEXT, teams TEXT, locations TEXT, "storyArcs" TEXT,
+                inker TEXT, editor TEXT, translator TEXT, tags TEXT, format TEXT,
+                "languageISO" TEXT, "communityRating" REAL, "blackAndWhite" BOOLEAN,
+                gtin TEXT, notes TEXT, "scanInformation" TEXT, review TEXT, "mainCharacterOrTeam" TEXT,
+                "alternateSeries" TEXT, "alternateNumber" TEXT, "alternateCount" INTEGER, "storyArcNumber" TEXT)"#,
+            r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT,
+                "isAnnual" BOOLEAN DEFAULT false, "hasCustomMetadata" BOOLEAN DEFAULT false, "attachedVolumeId" TEXT,
+                "coversIssues" TEXT, name TEXT, description TEXT,
+                "releaseDate" TEXT, universe TEXT, genres TEXT, "storyArcs" TEXT,
+                writers TEXT, artists TEXT, characters TEXT, "coverArtists" TEXT, colorists TEXT,
+                letterers TEXT, teams TEXT, locations TEXT, inker TEXT, editor TEXT, translator TEXT,
+                tags TEXT, "mainCharacterOrTeam" TEXT, "alternateSeries" TEXT, "alternateNumber" TEXT,
+                "alternateCount" INTEGER, "storyArcNumber" TEXT, gtin TEXT, notes TEXT,
+                "scanInformation" TEXT, review TEXT, "communityRating" REAL, "blackAndWhite" BOOLEAN,
+                "metadataId" TEXT, "metadataSource" TEXT)"#,
+            r#"CREATE TABLE "AttachedVolume" (id TEXT PRIMARY KEY, "seriesId" TEXT, "metadataSource" TEXT,
+                "volumeId" TEXT, kind TEXT, name TEXT, "startYear" INTEGER, "issueCount" INTEGER DEFAULT 0,
+                "lastSyncedAt" DATETIME, "createdAt" DATETIME, "updatedAt" DATETIME)"#,
+        ] {
+            sqlx::query(ddl).execute(&db.pool).await.expect("create schema");
+        }
+        sqlx::query(
+            r#"INSERT INTO "Series" (id, name, publisher, year, "folderPath", "metadataId", "metadataSource", status)
+               VALUES ('s251', 'Saga', 'Image', 2012, $1, 'local-1', 'LOCAL', 'Ongoing')"#,
+        ).bind(folder.to_string_lossy().replace('\\', "/")).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO "Issue" (id, "seriesId", "filePath", number, name, "metadataSource")
+               VALUES ('i251', 's251', $1, '1', 'Chapter One', 'LOCAL')"#,
+        ).bind(cbz.to_string_lossy().replace('\\', "/")).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('metadata_write_comicinfo', 'false')"#)
+            .execute(&db.pool).await.unwrap();
+
+        let untouched = std::fs::read(&cbz).unwrap();
+        sync_metadata(db.clone(), Some(vec!["s251".into()]), false, None).await.expect("sync, writing off");
+        assert_eq!(std::fs::read(&cbz).unwrap(), untouched, "writing off: the archive is left byte for byte");
+        assert!(folder.join("series.json").exists(), "series.json is its own setting and still follows the sync");
+        let synced: Option<String> = sqlx::query_scalar(&format!(
+            r#"SELECT {} FROM "Series" WHERE id = 's251'"#, db.iso_utc_expr(r#""lastMetadataSync""#)
+        )).fetch_one(&db.pool).await.unwrap();
+        assert!(synced.is_some(), "the sync itself still ran");
+
+        // The Smart Matcher's "Write to file" outranks the setting...
+        sync_metadata(db.clone(), Some(vec!["s251".into()]), false, Some(true)).await.expect("sync, write asked for");
+        let xml = comicinfo(&cbz).expect("an edit's own choice writes the file");
+        assert!(xml.contains("<Title>Chapter One</Title>"), "{xml}");
+
+        // ...and so does "keep it in Omnibus" when the setting is on.
+        sqlx::query(r#"UPDATE "SystemSetting" SET value = 'true' WHERE key = 'metadata_write_comicinfo'"#)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query(r#"UPDATE "Issue" SET name = 'Renamed In Omnibus' WHERE id = 'i251'"#)
+            .execute(&db.pool).await.unwrap();
+        sync_metadata(db.clone(), Some(vec!["s251".into()]), false, Some(false)).await.expect("sync, file left alone");
+        assert!(comicinfo(&cbz).unwrap().contains("<Title>Chapter One</Title>"), "the file keeps what it had");
+
+        // With the setting on and no choice made, a sync embeds as it always has.
+        sync_metadata(db.clone(), Some(vec!["s251".into()]), false, None).await.expect("sync, setting on");
+        assert!(comicinfo(&cbz).unwrap().contains("<Title>Renamed In Omnibus</Title>"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

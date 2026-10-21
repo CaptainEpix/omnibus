@@ -287,10 +287,10 @@ export function MetadataTab({ s }: { s: SettingsBag }) {
                             />
                             <div className="grid gap-1 ml-2">
                                 <Label htmlFor="metadata-write-comicinfo" className="cursor-pointer font-bold text-base text-foreground">
-                                    Write metadata edits to ComicInfo.xml
+                                    Write metadata to ComicInfo.xml
                                 </Label>
                                 <p className="text-[11px] text-muted-foreground">
-                                    Default for the Edit Metadata dialog: when on, manual edits are embedded back into each comic's <code>ComicInfo.xml</code>. When off, edits are kept in Omnibus only and the files are left untouched (Komga-style). Each edit can still override this with its own toggle.
+                                    When on, Omnibus keeps each comic&apos;s <code>ComicInfo.xml</code> up to date: after your edits, metadata syncs, Smart Matcher matches, attaching a volume, and the scheduled Embed job. When off, metadata stays in Omnibus only and your files are never rewritten (Komga-style). An edit can still write its own changes with its own toggle. The <code>series.json</code> export above is a separate setting.
                                 </p>
                             </div>
                         </div>

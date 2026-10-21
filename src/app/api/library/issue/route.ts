@@ -13,6 +13,7 @@ import { parseComicVineCredits } from '@/lib/utils';
 import { sanitizeDescription, providerWikiBase } from '@/lib/utils/sanitize';
 import { safeParse } from '@/lib/utils/safe-parse';
 import { omnibusQueue } from '@/lib/queue';
+import { resolveWriteToFile } from '@/lib/comicinfo-writes';
 import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-access';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { issueIdentityMismatch } from '@/lib/metadata/issue-identity';
@@ -455,11 +456,7 @@ export async function PATCH(request: Request) {
         await prisma.issue.update({ where: { id: issueId }, data });
 
         // Write-to-file decision: an explicit per-edit toggle wins; otherwise the global default.
-        let writeToFile = body.writeToFile;
-        if (writeToFile === undefined) {
-            const setting = await prisma.systemSetting.findUnique({ where: { key: 'metadata_write_comicinfo' } });
-            writeToFile = setting?.value !== 'false'; // default: write
-        }
+        const writeToFile = await resolveWriteToFile(body.writeToFile);
 
         if (writeToFile) {
             try {

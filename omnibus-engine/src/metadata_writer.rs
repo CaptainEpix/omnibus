@@ -16,6 +16,26 @@ pub struct EmbedRequest {
     pub issue_ids: Option<Vec<String>>,
 }
 
+/// #251: whether a sync writes ComicInfo.xml into a series' files. "Write metadata to ComicInfo.xml"
+/// (`setting` = metadata_write_comicinfo; an absent row is on) covers every automatic write, and an
+/// edit's own write-to-file choice (`asked`, the Smart Matcher's toggle) is the only override. Node
+/// twin: src/lib/comicinfo-writes.ts.
+pub(crate) fn writes_comicinfo(setting: Option<&str>, asked: Option<bool>) -> bool {
+    asked.unwrap_or(setting != Some("false"))
+}
+
+/// #251: what a metadata sync does to a series' files once its rows are refreshed - the full
+/// ComicInfo.xml embed (which writes series.json too), or, with ComicInfo writing off, series.json
+/// alone: it is its own setting, and it used to ride only inside the embed loop. Returns the embed
+/// job's (embedded, failed, series.json files written). Node twin: queueFilesAfterSync.
+pub(crate) async fn refresh_files_after_sync(db: &Db, series_id: &str, write_comicinfo: bool) -> anyhow::Result<(i32, i32, i32)> {
+    if write_comicinfo {
+        return process_embed_job(db.clone(), EmbedRequest { series_id: Some(series_id.to_string()), issue_ids: None }).await;
+    }
+    log::debug!("[Writer] ComicInfo.xml writing is off: series {} keeps its files as they are (series.json only).", series_id);
+    Ok((0, 0, i32::from(write_series_json(db, series_id).await)))
+}
+
 struct EmbedTask {
     file_path: String,
     xml_content: String,
@@ -1548,5 +1568,15 @@ mod tests {
     fn merge_falls_back_to_generated_on_unparseable_existing() {
         assert_eq!(merge_comicinfo(GEN, "not xml at all", "test.cbz"), GEN);
         assert_eq!(merge_comicinfo(GEN, "<ComicInfo></ComicInfo>", "test.cbz"), GEN);
+    }
+
+    // #251: one rule for a sync's ComicInfo.xml writes (Node twin: src/lib/comicinfo-writes.ts).
+    #[test]
+    fn a_sync_writes_comicinfo_per_the_setting_unless_an_edit_chose_for_itself() {
+        assert!(writes_comicinfo(None, None), "an absent row is the default: on");
+        assert!(writes_comicinfo(Some("true"), None));
+        assert!(!writes_comicinfo(Some("false"), None), "off: Omnibus never writes ComicInfo.xml on its own");
+        assert!(writes_comicinfo(Some("false"), Some(true)), "an edit's own toggle wins (the Smart Matcher's Write to file)");
+        assert!(!writes_comicinfo(Some("true"), Some(false)), "...including its keep-in-Omnibus choice");
     }
 }

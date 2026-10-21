@@ -265,6 +265,55 @@ describe('Cron: BullMQ Worker Router', () => {
         );
     });
 
+    // #251: the scheduled embed (and its Run Now) is a library-wide rewrite; "Write metadata to
+    // ComicInfo.xml" off means it never runs.
+    it('should skip a scheduled bulk EMBED_METADATA while ComicInfo writing is off', async () => {
+        initWorker();
+        mocks.systemSettingFindUnique.mockResolvedValueOnce({ key: 'metadata_write_comicinfo', value: 'false' });
+
+        await mocks.workerCb.current({ id: 'job_embed_off', data: { type: 'EMBED_METADATA' }, updateProgress: vi.fn() });
+
+        expect(mocks.systemSettingFindUnique).toHaveBeenCalledWith({ where: { key: 'metadata_write_comicinfo' } });
+        expect(mocks.engineFetch).not.toHaveBeenCalled();
+        expect(mocks.systemSettingUpsert).not.toHaveBeenCalledWith(
+            expect.objectContaining({ where: { key: 'last_embed_sync' } })
+        );
+        expect(mocks.jobLogCreate).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({
+                jobType: 'EMBED_METADATA',
+                status: 'COMPLETED_WITH_ERRORS',
+                message: expect.stringContaining('Skipped')
+            })
+        }));
+    });
+
+    it('should still forward a targeted EMBED_METADATA while writing is off: the edit already chose to write', async () => {
+        initWorker();
+        mocks.systemSettingFindUnique.mockImplementation(async () => ({ key: 'metadata_write_comicinfo', value: 'false' }));
+        try {
+            await mocks.workerCb.current({ id: 'job_embed_edit', data: { type: 'EMBED_METADATA', issueIds: ['i1'] }, updateProgress: vi.fn() });
+
+            expect(mocks.engineFetch).toHaveBeenCalledWith(
+                `${ENGINE_URL}/api/metadata/embed`,
+                expect.objectContaining({ body: JSON.stringify({ series_id: null, issue_ids: ['i1'] }) })
+            );
+        } finally {
+            mocks.systemSettingFindUnique.mockReset();
+        }
+    });
+
+    // #251 (#230 item 7): the Smart Matcher's "Write to file" toggle reaches the engine's sync.
+    it('should forward a sync\'s writeComicInfo choice to the engine as write_comicinfo', async () => {
+        initWorker();
+
+        await mocks.workerCb.current({ id: 'job_meta_write', data: { type: 'METADATA_SYNC', seriesIds: ['series_1'], writeComicInfo: false }, updateProgress: vi.fn() });
+
+        expect(mocks.engineFetch).toHaveBeenCalledWith(
+            `${ENGINE_URL}/api/metadata/sync`,
+            expect.objectContaining({ body: JSON.stringify({ series_ids: ['series_1'], write_comicinfo: false }) })
+        );
+    });
+
     it('should forward EXPORT_SERIES_JSON to the engine when the export is enabled', async () => {
         initWorker();
 

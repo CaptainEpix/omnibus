@@ -22,8 +22,11 @@ export const stubFetchRouter = (routes: Array<[string | RegExp, (url: string, in
     return fn;
 };
 
-/** Collapses setTimeout delays to the next tick — for retry/backoff code under test. */
-export const stubImmediateTimers = () => {
+/** Collapses setTimeout delays to the next tick — for retry/backoff code under test. Pass `onlyMs`
+ *  to collapse just that one delay (a scan's fixed pause, say) and keep every other timer real,
+ *  waitFor's own timeout included. */
+export const stubImmediateTimers = (onlyMs?: number) => {
     const originalSetTimeout = globalThis.setTimeout;
-    vi.stubGlobal('setTimeout', ((cb: any) => originalSetTimeout(cb, 0)) as any);
+    vi.stubGlobal('setTimeout', ((cb: () => void, ms?: number) =>
+        originalSetTimeout(cb, onlyMs === undefined || ms === onlyMs ? 0 : ms)) as typeof setTimeout);
 };

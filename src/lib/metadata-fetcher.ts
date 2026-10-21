@@ -16,6 +16,8 @@ import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
 import { findLocalCoverBasename, providerCoverBlocked } from '@/lib/utils/cover-plan';
 import { CV_VOLUME_CREDIT_FIELDS, parseVolumeCredits, persistSeriesCredits } from '@/lib/utils/volume-credits';
+import { syncedReleaseDate } from '@/lib/utils/synced-release-date';
+import { comicInfoWritesEnabled } from '@/lib/comicinfo-writes';
 
 // ComicVine signals its velocity/burst block with HTTP 420 (not 429) -- a separate throttle from
 // the documented 200/hr quota that can trip even well under it. Engine parity: metadata.rs
@@ -55,6 +57,27 @@ export function guessBookTypeFromCvVolume(
         return startYear > 0 && startYear <= currentYear - 2 ? 'OneShot' : null;
     }
     return null;
+}
+
+/**
+ * What a sync does to a series' files once its rows are refreshed (#251): the ComicInfo.xml embed
+ * while "Write metadata to ComicInfo.xml" is on, otherwise series.json alone - it is its own setting,
+ * and it used to ride inside the embed. Delayed 5 minutes to let the whole batch finish downloading,
+ * one job per series per 15-minute window. Engine twin: metadata_writer.rs refresh_files_after_sync.
+ */
+async function queueFilesAfterSync(series: { id: string; name: string }) {
+    try {
+        const ioTimeWindow = Math.floor(Date.now() / 900000);
+        const opts = { delay: 300000, removeOnComplete: true, removeOnFail: true };
+        if (await comicInfoWritesEnabled()) {
+            await omnibusQueue.add('EMBED_METADATA', { type: 'EMBED_METADATA', seriesId: series.id },
+                { jobId: `EMBED_META_${series.id}_${ioTimeWindow}`, ...opts });
+            Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
+        } else {
+            await omnibusQueue.add('EXPORT_SERIES_JSON', { type: 'EXPORT_SERIES_JSON', seriesId: series.id },
+                { jobId: `EXPORT_SJ_SYNC_${series.id}_${ioTimeWindow}`, ...opts });
+        }
+    } catch {}
 }
 
 export async function syncSeriesMetadata(metadataId: string, folderPath: string, metadataSource: string = 'COMICVINE') {
@@ -188,14 +211,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 }
                 const healId = !!targetRecord && targetRecord.metadataId !== issue.sourceId;
                 const isLocked = (targetRecord as any)?.hasCustomMetadata || false;
-                // file_metadata_priority: a release date already on the row is kept ONLY when this
-                // issue actually has a file — a WANTED placeholder has no cover date to protect, and
-                // needs the provider's store date to keep moving as a delayed issue's real release
-                // date becomes known (engine parity, review of #232).
-                const hasFile = !!(targetRecord as any)?.filePath;
-                const releaseVal = isLocked
-                    ? targetRecord!.releaseDate
-                    : (fillOnly && hasFile && targetRecord?.releaseDate) ? targetRecord.releaseDate : issue.releaseDate;
+                // file_metadata_priority keeps a filed issue's own release date; a placeholder keeps
+                // taking the store date (review of #232 - the shared policy, engine twin).
+                const releaseVal = syncedReleaseDate(targetRecord?.releaseDate, issue.releaseDate, isLocked, fillOnly, !!targetRecord?.filePath);
 
                 const issueDataPayload = {
                     // #199 round 3: Metron list names are composites ("X-Men (1991) #154") — the
@@ -320,21 +338,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 if (enriched > 0) Logger.log(`[Metadata] Enriched ${enriched} Metron issue(s) of "${series.name}" with detail-call credits.`, 'info');
             }
 
-            try {
-                // 15-minute rolling window for heavy disk I/O
-                const ioTimeWindow = Math.floor(Date.now() / 900000); 
-                
-                await omnibusQueue.add('EMBED_METADATA', { 
-                    type: 'EMBED_METADATA', 
-                    seriesId: series.id 
-                }, {
-                    jobId: `EMBED_META_${series.id}_${ioTimeWindow}`,
-                    delay: 300000, // 5-minute delay to let the entire batch finish downloading
-                    removeOnComplete: true,
-                    removeOnFail: true
-                });
-                Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+            await queueFilesAfterSync(series);
 
             Logger.log(`[Metadata] Successfully synced ${syncedCount} Metron issues.`, 'success');
             return { success: true, count: syncedCount };
@@ -530,14 +534,10 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
             }
             const healId = !!targetRecord && targetRecord.metadataId !== cvIdStr;
             const isLocked = (targetRecord as any)?.hasCustomMetadata || false;
-            // file_metadata_priority: a release date already on the row is kept ONLY when this
-            // issue actually has a file — a WANTED placeholder has no cover date to protect, and
-            // needs the provider's store date to keep moving as a delayed issue's real release
-            // date becomes known (engine parity, review of #232).
-            const hasFile = !!(targetRecord as any)?.filePath;
-            const releaseVal = isLocked
-                ? targetRecord!.releaseDate
-                : (fillOnly && hasFile && targetRecord?.releaseDate) ? targetRecord.releaseDate : (cvIssue.store_date || cvIssue.cover_date || null);
+            // file_metadata_priority keeps a filed issue's own release date; a placeholder keeps
+            // taking the store date (review of #232 - the shared policy, engine twin).
+            const releaseVal = syncedReleaseDate(targetRecord?.releaseDate, cvIssue.store_date || cvIssue.cover_date || null,
+                isLocked, fillOnly, !!targetRecord?.filePath);
 
             const issueDataPayload = {
                 // Shared resolver (#199 round 3): keeps lock + file-priority semantics and stops a
@@ -619,21 +619,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
         }
     }
 
-    try {
-                // 15-minute rolling window for heavy disk I/O
-                const ioTimeWindow = Math.floor(Date.now() / 900000); 
-                
-                await omnibusQueue.add('EMBED_METADATA', { 
-                    type: 'EMBED_METADATA', 
-                    seriesId: series.id 
-                }, {
-                    jobId: `EMBED_META_${series.id}_${ioTimeWindow}`,
-                    delay: 300000, // 5-minute delay to let the entire batch finish downloading
-                    removeOnComplete: true,
-                    removeOnFail: true
-                });
-                Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+    await queueFilesAfterSync(series);
 
     Logger.log(`[Metadata] Successfully synced ${syncedCount} ComicVine issues.`, 'success');
     return { success: true, count: syncedCount };

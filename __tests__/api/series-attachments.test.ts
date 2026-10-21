@@ -17,6 +17,8 @@ vi.mock('@/lib/db', () => ({
         attachedVolume: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), upsert: vi.fn(), delete: vi.fn() },
         issue: { groupBy: vi.fn(), findMany: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn(), update: vi.fn(), delete: vi.fn(), count: vi.fn() },
         library: { findMany: vi.fn(async () => [{ id: 'lib1', path: '/comics' }]) },
+        // No row = "Write metadata to ComicInfo.xml" at its default, on (#251).
+        systemSetting: { findUnique: vi.fn(async () => null) },
     }
 }));
 // LOCAL attachments with a sourcePath hand the move to the collision helper; the route is tested
@@ -79,6 +81,19 @@ describe('API: /api/library/series/attachments', () => {
             { type: 'EMBED_METADATA', issueIds: ['a1', 'a2'] },
             expect.objectContaining({ jobId: expect.stringContaining('att1') }),
         ]]);
+    });
+
+    // #251: an attach is not a write-to-file choice, so the setting decides like every other sync.
+    it("leaves the lane's files alone while ComicInfo writing is off", async () => {
+        vi.mocked(prisma.systemSetting.findUnique).mockResolvedValueOnce({ key: 'metadata_write_comicinfo', value: 'false' } as never);
+        vi.mocked(prisma.issue.findMany).mockResolvedValue([
+            { id: 'a1', filePath: '/comics/Batman/Batman Annual #001 (2012).cbz' },
+        ] as never);
+
+        const res = await POST(createReq({ seriesId: 's1', volumeId: '49197', metadataSource: 'COMICVINE' }));
+
+        expect(res.status).toBe(200);
+        expect(embedJobs()).toEqual([]);
     });
 
     it('queues no rewrite when the lane owns no files (skeletons only)', async () => {

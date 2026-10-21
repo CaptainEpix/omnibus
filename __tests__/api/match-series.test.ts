@@ -7,6 +7,7 @@ import { makePostJson } from '../helpers/request';
 import { pinPlatform } from '../helpers/platform';
 import { notifierSendAlert } from '../helpers/setup-global';
 import { Logger } from '@/lib/logger';
+import { omnibusQueue } from '@/lib/queue';
 
 // 1. Hoist the mocks
 const mocks = vi.hoisted(() => ({
@@ -201,6 +202,32 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(mocks.createSeries).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ metadataSource: 'COMICVINE', name: 'Batman (CV)', year: 2016 })
         }));
+    });
+
+    // #251 (#230 item 7): the match's embed rides on the METADATA_SYNC it queues, so the dialog's
+    // "Write to file" toggle has to travel with that sync - it used to be read and then dropped.
+    const cvVolume = { data: { results: { name: 'Batman (CV)', start_year: '2016' } } } as unknown as Awaited<ReturnType<typeof axios.get>>;
+
+    it.each([false, true])('hands the dialog\'s write-to-file choice (%s) to the sync it queues', async (writeToFile) => {
+        mocks.findUniqueSetting.mockResolvedValueOnce({ value: 'cv_api_key' });
+        vi.mocked(axios.get).mockResolvedValueOnce(cvVolume);
+
+        const res = await POST(createReq({ oldFolderPath: '/unmatched/Batman', metadataId: '4050-1234', writeToFile }));
+        expect(res.status).toBe(200);
+
+        const syncs = vi.mocked(omnibusQueue.add).mock.calls.filter(c => c[0] === 'METADATA_SYNC');
+        expect(syncs).toHaveLength(1);
+        expect(syncs[0][1]).toEqual({ type: 'METADATA_SYNC', seriesIds: ['series_123'], writeComicInfo: writeToFile });
+    });
+
+    it('leaves the write to the setting when the request makes no choice', async () => {
+        mocks.findUniqueSetting.mockResolvedValueOnce({ value: 'cv_api_key' });
+        vi.mocked(axios.get).mockResolvedValueOnce(cvVolume);
+
+        await POST(createReq({ oldFolderPath: '/unmatched/Batman', metadataId: '4050-1234' }));
+
+        const syncs = vi.mocked(omnibusQueue.add).mock.calls.filter(c => c[0] === 'METADATA_SYNC');
+        expect(syncs[0][1]).toEqual({ type: 'METADATA_SYNC', seriesIds: ['series_123'] });
     });
 
     it('should route to Metron if metadataSource is explicitly passed as METRON', async () => {

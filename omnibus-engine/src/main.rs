@@ -80,6 +80,9 @@ struct MetadataRequest {
     /// A person asked for per-issue Metron credits on this refresh (the Refresh button's ask).
     #[serde(default)]
     fetch_credits: bool,
+    /// #251: the Smart Matcher's "write to file" choice for this sync; absent = the setting decides.
+    #[serde(default)]
+    write_comicinfo: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1283,7 +1286,7 @@ async fn handle_metadata_sync(
     tokio::spawn(async move {
         let db = state.db.clone();
         let start_time = std::time::Instant::now();
-        match metadata::sync_metadata(state.db.clone(), payload.series_ids, payload.fetch_credits).await {
+        match metadata::sync_metadata(state.db.clone(), payload.series_ids, payload.fetch_credits, payload.write_comicinfo).await {
             Ok(_) => notify_node("job_metadata_sync", "Metadata synchronization completed.").await,
             Err(e) => {
                 log::error!("❌ Background Metadata Synchronization failed: {:?}", e);

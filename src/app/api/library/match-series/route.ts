@@ -855,7 +855,14 @@ export async function POST(request: Request) {
         }
         
         if (existingRecord?.id) {
-            await omnibusQueue.add('METADATA_SYNC', { type: 'METADATA_SYNC', seriesIds: [existingRecord.id] }, { jobId: `METADATA_SYNC_MATCH_${existingRecord.id}_${Date.now()}` });
+            // #251 (#230 item 7): the match's ComicInfo.xml embed rides on this sync (see the race note
+            // below), so the dialog's "Write to file" toggle travels with it - it used to be read and
+            // dropped. No toggle sent: the engine follows "Write metadata to ComicInfo.xml".
+            await omnibusQueue.add('METADATA_SYNC', {
+                type: 'METADATA_SYNC',
+                seriesIds: [existingRecord.id],
+                ...(typeof writeToFile === 'boolean' ? { writeComicInfo: writeToFile } : {}),
+            }, { jobId: `METADATA_SYNC_MATCH_${existingRecord.id}_${Date.now()}` });
 
             // #199 round 4 Beta B (replace mode): the admin explicitly chose a provider rewrite —
             // regenerate this series' series.json NOW instead of waiting for the scheduled export

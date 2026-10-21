@@ -41,11 +41,12 @@ export default function ScheduledJobsPage() {
   const [metadataSyncSchedule, setMetadataSyncSchedule] = useState<string>(D.metadata_sync_schedule)
   const [embedMetadataSchedule, setEmbedMetadataSchedule] = useState<string>(D.embed_metadata_schedule)
   const [seriesJsonSchedule, setSeriesJsonSchedule] = useState<string>(D.series_json_schedule)
-  // Feature toggles are READ-ONLY here (Phase 3, one owner per setting): the series.json export
-  // lives in Settings → Metadata and CBR auto-conversion in Settings → Library & Files. This page
+  // Feature toggles are READ-ONLY here (Phase 3, one owner per setting): the series.json export and
+  // ComicInfo.xml writing live in Settings → Metadata, CBR auto-conversion in Settings → Library & Files. This page
   // only reflects their state so a scheduled job that would skip is explained, never flips them.
   const [seriesJsonEnabled, setSeriesJsonEnabled] = useState(true) // default ON (discussion #182)
   const [cbrConversionEnabled, setCbrConversionEnabled] = useState(true) // default ON
+  const [comicInfoWritesEnabled, setComicInfoWritesEnabled] = useState(true) // default ON (#251)
   const [librarySyncSchedule, setLibrarySyncSchedule] = useState<string>(D.library_sync_schedule)
   const [monitorSyncSchedule, setMonitorSyncSchedule] = useState<string>(D.monitor_sync_schedule)
   const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState<string>(D.diagnostics_sync_schedule)
@@ -164,6 +165,8 @@ export default function ScheduledJobsPage() {
         setSeriesJsonEnabled(seriesJsonEnabledItem?.value !== 'false');
         const cbrEnabledItem = data.settings.find((c: any) => c.key === 'cbr_conversion_enabled');
         setCbrConversionEnabled(cbrEnabledItem?.value !== 'false');
+        const comicInfoItem = data.settings.find((c: { key: string }) => c.key === 'metadata_write_comicinfo');
+        setComicInfoWritesEnabled(comicInfoItem?.value !== 'false');
         if (libItem) setLibrarySyncSchedule(libItem.value);
         if (monitorItem) setMonitorSyncSchedule(monitorItem.value);
         if (diagItem) setDiagnosticsSyncSchedule(diagItem.value);
@@ -378,7 +381,7 @@ export default function ScheduledJobsPage() {
                     </CardContent>
                 </Card>
 
-                <Card className="shadow-sm border-border bg-background transition-all hover:shadow-md">
+                <Card className={`shadow-sm border-border bg-background transition-all hover:shadow-md ${!comicInfoWritesEnabled ? 'opacity-80' : ''}`}>
                     <CardHeader className="pb-3">
                         <CardTitle className="flex items-center gap-2 text-lg text-foreground"><FileJson className="w-5 h-5 text-primary" /> Embed XML Metadata</CardTitle>
                         <CardDescription className="text-muted-foreground">Writes ComicInfo.xml data directly into your downloaded .cbz archives. CBR/RAR files are read-only (RAR can&apos;t be rewritten) — keep the CBR Auto-Converter on if you want those tagged too.</CardDescription>
@@ -390,7 +393,13 @@ export default function ScheduledJobsPage() {
                                 {INTERVALS.map(i => <SelectItem key={i.value} value={i.value} className="focus:bg-primary/10 focus:text-primary">{i.label}</SelectItem>)}
                             </SelectContent>
                         </Select>
-                        <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('embed_metadata')} disabled={runningJob === 'embed_metadata'}>
+                        {!comicInfoWritesEnabled && (
+                            <p className="text-[11px] text-amber-600 dark:text-amber-500 font-medium leading-snug">
+                                ComicInfo.xml writing is turned off, so this schedule won&apos;t run. Enable it in{' '}
+                                <Link href="/admin/settings" className="underline font-bold hover:text-amber-700 dark:hover:text-amber-400">Settings &rarr; Metadata</Link>.
+                            </p>
+                        )}
+                        <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('embed_metadata')} disabled={runningJob === 'embed_metadata' || !comicInfoWritesEnabled}>
                             {runningJob === 'embed_metadata' ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <Play className="w-4 h-4 mr-2"/>} Run Now
                         </Button>
                     </CardContent>
