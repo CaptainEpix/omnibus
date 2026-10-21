@@ -1014,7 +1014,7 @@ export default function ProfilePage() {
                                         </div>
                                         <div className="flex flex-col justify-center">
                                             <h4 className="font-bold text-sm line-clamp-2 leading-tight">{list.name}</h4>
-                                            <p className="text-xs font-bold text-primary mt-1">{list.items?.length || 0} Issues</p>
+                                            <p className="text-xs font-bold text-primary mt-1">{list.counts?.total ?? 0} Issues</p>
                                         </div>
                                     </CardContent>
                                 </Card>

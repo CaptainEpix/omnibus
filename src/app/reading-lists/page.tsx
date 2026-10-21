@@ -27,6 +27,38 @@ import { getErrorMessage } from "@/lib/utils/error"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
+// #253: "Hide read" is a per-viewer convenience, remembered in this browser only.
+const HIDE_READ_KEY = 'omnibus-reading-lists-hide-read'
+
+// #252: what GET /api/reading-lists?id= returns - only the fields this page uses.
+type ListSeries = { id: string; name: string; folderPath: string | null; metadataId: string | null; metadataSource: string | null }
+type ListIssue = { id: string; number: string; name: string | null; filePath: string | null; coverUrl: string | null; metadataSource: string | null; series: ListSeries }
+type ListProgress = { isRead: boolean; readProgress: number }
+type ListItem = {
+  id: string; order: number; title: string; cvIssueId: number | null; metadataSource: string
+  issueId: string | null; issue: ListIssue | null; progress: ListProgress | null
+}
+type ListDetail = {
+  id: string; name: string; description: string | null; coverUrl: string | null; isGlobal: boolean
+  userId: string | null; shareId: string | null; user: { username: string } | null; items: ListItem[]
+}
+type OwnedItem = ListItem & { issue: ListIssue }
+
+// An entry you can open: a linked issue with a file (a linked WANTED placeholder has nothing to read yet).
+const isOwned = (item: ListItem): item is OwnedItem => !!item.issue?.filePath
+const readerHref = (issue: ListIssue) => `/reader?path=${encodeURIComponent(issue.filePath ?? '')}&series=${encodeURIComponent(issue.series.folderPath ?? '')}`
+
+/** #253: the series page's reading badges - a check once finished, a percentage while reading. */
+function ReadingState({ progress }: { progress: ListProgress | null }) {
+    if (progress?.isRead) {
+        return <Badge data-testid="reading-state" className="shrink-0 bg-green-600 border-0 text-white text-[10px] px-1.5 h-5"><Check className="w-3 h-3 mr-1" />Read</Badge>
+    }
+    if (progress && progress.readProgress > 0) {
+        return <Badge data-testid="reading-state" className="shrink-0 bg-primary border-0 text-primary-foreground text-[10px] px-1.5 h-5">{Math.round(progress.readProgress)}%</Badge>
+    }
+    return null
+}
+
 function ReadingListsContent() {
   const { data: session } = useSession()
   const isAdmin = session?.user?.role === 'ADMIN'
@@ -34,8 +66,13 @@ function ReadingListsContent() {
   const paramId = searchParams.get('id')
   const { toast } = useToast()
   
+  // #252: `lists` is the overview (names + counts); the open list's items live in `activeListDetail`.
   const [lists, setLists] = useState<any[]>([])
   const [activeListId, setActiveListId] = useState<string | null>(null)
+  const [activeListDetail, setActiveListDetail] = useState<ListDetail | null>(null)
+  const [detailReload, setDetailReload] = useState(0)
+  const [listFilter, setListFilter] = useState("")
+  const [hideRead, setHideRead] = useState(false)
   const [loading, setLoading] = useState(true)
   
   // Modals
@@ -143,37 +180,25 @@ function ReadingListsContent() {
   const [viewMode, setViewMode] = useState<'grouped' | 'flat'>('grouped')
   const [expandedChunks, setExpandedChunks] = useState<Set<string>>(new Set())
 
-  // Group sequential items of the same series to preserve reading order
+  // Group sequential items of the same series to preserve reading order. Each entry keeps its place
+  // in the list; "Hide read" (#253) then drops finished entries, so a chunk's id - its first entry's
+  // place - never moves and an expanded chunk stays expanded.
   const groupedItems = useMemo(() => {
-      const activeList = lists.find(l => l.id === activeListId);
-      if (!activeList) return [];
-      
-      const chunks: { id: string, seriesName: string, items: any[], startIndex: number }[] = [];
-      let currentChunk: any[] = [];
-      let currentSeriesName: string | null = null;
-      let startIndex = 0;
+      if (!activeListDetail || activeListDetail.id !== activeListId) return [];
 
-      activeList.items.forEach((item: any, idx: number) => {
+      const chunks: { id: string, seriesName: string, entries: { item: ListItem, index: number }[] }[] = [];
+      activeListDetail.items.forEach((item, index) => {
           const seriesName = item.issue?.series?.name || "Missing/Unlinked Issue";
-          
-          if (seriesName !== currentSeriesName) {
-              if (currentChunk.length > 0) {
-                  chunks.push({ id: `chunk-${chunks.length}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
-              }
-              currentChunk = [item];
-              currentSeriesName = seriesName;
-              startIndex = idx;
-          } else {
-              currentChunk.push(item);
-          }
+          const last = chunks[chunks.length - 1];
+          if (last && last.seriesName === seriesName) last.entries.push({ item, index });
+          else chunks.push({ id: `chunk-${index}`, seriesName, entries: [{ item, index }] });
       });
 
-      if (currentChunk.length > 0) {
-          chunks.push({ id: `chunk-${chunks.length}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
-      }
-
-      return chunks;
-  }, [lists, activeListId]);
+      if (!hideRead) return chunks;
+      return chunks
+          .map(chunk => ({ ...chunk, entries: chunk.entries.filter(e => !e.item.progress?.isRead) }))
+          .filter(chunk => chunk.entries.length > 0);
+  }, [activeListDetail, activeListId, hideRead]);
 
   const toggleChunk = (chunkId: string) => {
       setExpandedChunks(prev => {
@@ -194,6 +219,28 @@ function ReadingListsContent() {
     }
   }, [paramId])
 
+  useEffect(() => {
+    try { setHideRead(localStorage.getItem(HIDE_READ_KEY) === 'true') } catch { /* storage blocked: default off */ }
+  }, [])
+
+  const toggleHideRead = (on: boolean) => {
+    setHideRead(on)
+    try { localStorage.setItem(HIDE_READ_KEY, String(on)) } catch { /* storage blocked: this visit only */ }
+  }
+
+  // #252: the open list's items (with the caller's progress) have their own request. A reload of the
+  // same list bumps `detailReload`; an answer for a list the user has already left is dropped.
+  useEffect(() => {
+    if (!activeListId) { setActiveListDetail(null); return }
+    let cancelled = false
+    fetch(`/api/reading-lists?id=${encodeURIComponent(activeListId)}&t=${Date.now()}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (!cancelled && data) setActiveListDetail(data) })
+      .catch(() => { /* the overview's own error toast covers an unreachable server */ })
+    return () => { cancelled = true }
+  }, [activeListId, detailReload])
+
+  // Refreshes the overview (names + counts), picks the list to show, and reloads that list's items.
   const fetchLists = async (selectId?: string | null) => {
     try {
       const res = await fetch(`/api/reading-lists?t=${Date.now()}`)
@@ -207,6 +254,7 @@ function ReadingListsContent() {
         } else if (data.length === 0) {
             setActiveListId(null)
         }
+        setDetailReload(n => n + 1)
       }
     } catch (e) {
       toast({ title: "Error", description: "Failed to load reading lists.", variant: "destructive" })
@@ -656,18 +704,13 @@ function ReadingListsContent() {
   }
 
   const onDragEnd = async (result: any) => {
-      if (!result.destination || !activeListId) return;
-      
-      const activeListIndex = lists.findIndex(l => l.id === activeListId);
-      if (activeListIndex === -1) return;
+      if (!result.destination || !activeListId || activeListDetail?.id !== activeListId) return;
 
-      const newLists = [...lists];
-      const items = Array.from(newLists[activeListIndex].items);
+      const items = Array.from(activeListDetail.items);
       const [reorderedItem] = items.splice(result.source.index, 1);
       items.splice(result.destination.index, 0, reorderedItem);
 
-      newLists[activeListIndex].items = items;
-      setLists(newLists);
+      setActiveListDetail({ ...activeListDetail, items });
 
       const updatedOrder = items.map((item: any, index: number) => ({
           id: item.id,
@@ -694,8 +737,14 @@ function ReadingListsContent() {
       );
   }
 
-  const activeList = lists.find(l => l.id === activeListId);
+  const activeList = activeListDetail && activeListDetail.id === activeListId ? activeListDetail : null;
   const missingItems = activeList ? activeList.items.filter((i: any) => !i.issueId) : [];
+  // #253: where you are in the open list.
+  const readCount = activeList ? activeList.items.filter(i => i.progress?.isRead).length : 0;
+  const ownedCount = activeList ? activeList.items.filter(isOwned).length : 0;
+  const continueItem = activeList?.items.find((i): i is OwnedItem => isOwned(i) && !i.progress?.isRead);
+  const filterText = listFilter.trim().toLowerCase();
+  const visibleLists = filterText ? lists.filter(l => String(l.name).toLowerCase().includes(filterText)) : lists;
 
   return (
     <div className="container mx-auto py-10 px-6 max-w-[1400px] space-y-8 transition-colors duration-300">
@@ -751,12 +800,23 @@ function ReadingListsContent() {
                   </DropdownMenu>
               </div>
 
-              <Card className="shadow-sm border-border bg-background">
+              <Card data-testid="reading-list-sidebar" className="shadow-sm border-border bg-background">
                   <div className="p-2 flex flex-col gap-1">
+                      {lists.length > 0 && (
+                          <Input
+                              placeholder="Filter lists"
+                              aria-label="Filter reading lists by name"
+                              value={listFilter}
+                              onChange={e => setListFilter(e.target.value)}
+                              className="h-9 mb-1 bg-background border-border"
+                          />
+                      )}
                       {lists.length === 0 ? (
                           <div className="p-4 text-center text-sm text-muted-foreground italic">No reading lists created yet.</div>
+                      ) : visibleLists.length === 0 ? (
+                          <div className="p-4 text-center text-sm text-muted-foreground italic">No list names match &ldquo;{listFilter.trim()}&rdquo;.</div>
                       ) : (
-                          lists.map(list => (
+                          visibleLists.map(list => (
                               <div 
                                   key={list.id} 
                                   onClick={() => setActiveListId(list.id)}
@@ -771,7 +831,9 @@ function ReadingListsContent() {
                                           <h3 className={`font-bold truncate text-sm ${activeListId === list.id ? 'text-primary' : 'text-foreground'}`}>{list.name}</h3>
                                           {list.isGlobal && <span title={`Global List by ${list.user?.username || 'Unknown'}`}><Globe className="w-3 h-3 text-emerald-500 shrink-0" /></span>}
                                       </div>
-                                      <p className="text-[10px] text-muted-foreground uppercase tracking-wider mt-0.5">{list.items.length} Issues</p>
+                                      <p className="text-[10px] text-muted-foreground uppercase tracking-wider mt-0.5">
+                                          {list.counts?.total ?? 0} Issues{list.counts?.read > 0 && ` · ${list.counts.read} Read`}
+                                      </p>
                                   </div>
                               </div>
                           ))
@@ -791,6 +853,12 @@ function ReadingListsContent() {
                               </div>
                               
                               <div className="flex flex-wrap items-center gap-3 shrink-0 w-full xl:w-auto justify-start xl:justify-end">
+                                  {viewMode === 'grouped' && (
+                                      <div className="flex items-center gap-2">
+                                          <Switch id="hide-read" checked={hideRead} onCheckedChange={toggleHideRead} />
+                                          <Label htmlFor="hide-read" className="text-xs font-bold cursor-pointer text-foreground">Hide read</Label>
+                                      </div>
+                                  )}
                                   {/* --- VIEW MODE TOGGLE --- */}
                                   <div className="flex items-center gap-1 bg-muted p-1 rounded-md border border-border shadow-inner">
                                       <Button variant={viewMode === 'grouped' ? 'default' : 'ghost'} size="sm" onClick={() => setViewMode('grouped')} className={`h-8 px-3 text-xs ${viewMode === 'grouped' ? 'shadow-sm bg-background text-foreground' : 'text-muted-foreground'}`}>
@@ -852,6 +920,20 @@ function ReadingListsContent() {
                                   {activeList.description}
                               </CardDescription>
                           )}
+
+                          {activeList.items.length > 0 && (
+                              <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+                                  <span className="font-bold text-foreground">{readCount} / {activeList.items.length} read</span>
+                                  <span className="text-muted-foreground">{ownedCount} in your library</span>
+                                  {continueItem && (
+                                      <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
+                                          <Link href={readerHref(continueItem.issue)} title={`Continue with ${continueItem.issue.series?.name} #${continueItem.issue.number}`}>
+                                              <BookOpen className="w-3.5 h-3.5 mr-2" /> Continue
+                                          </Link>
+                                      </Button>
+                                  )}
+                              </div>
+                          )}
                       </CardHeader>
                   </Card>
 
@@ -864,19 +946,28 @@ function ReadingListsContent() {
                   ) : viewMode === 'grouped' ? (
                         /* --- NEW GROUPED COLLAPSIBLE VIEW --- */
                         <div className="space-y-4 pb-20">
+                            {hideRead && groupedItems.length === 0 && (
+                                <div className="text-center py-12 border-2 border-dashed rounded-xl border-border bg-muted/30 text-sm font-bold text-muted-foreground">
+                                    Everything in this list is read. Turn off &ldquo;Hide read&rdquo; to see it again.
+                                </div>
+                            )}
                             {groupedItems.map(chunk => {
                                 const isExpanded = expandedChunks.has(chunk.id);
                                 return (
                                     <div key={chunk.id} className="border border-border rounded-xl bg-background shadow-sm overflow-hidden transition-all">
-                                        <div 
+                                        <div
+                                            role="button"
+                                            tabIndex={0}
+                                            aria-expanded={isExpanded}
                                             className="p-4 bg-muted/30 flex items-center justify-between cursor-pointer hover:bg-muted/60 transition-colors"
                                             onClick={() => toggleChunk(chunk.id)}
+                                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleChunk(chunk.id); } }}
                                         >
                                             <div className="flex items-center gap-3">
                                                 <FolderOpen className="w-5 h-5 text-primary" />
                                                 <span className="font-bold text-foreground text-sm sm:text-base">{chunk.seriesName}</span>
                                                 <Badge variant="secondary" className="text-[10px] bg-primary/10 text-primary border-primary/20">
-                                                    {chunk.items.length} Issues
+                                                    {chunk.entries.length} Issues
                                                 </Badge>
                                             </div>
                                             <div className="bg-background rounded-full p-1 shadow-sm border border-border">
@@ -886,42 +977,44 @@ function ReadingListsContent() {
 
                                         {isExpanded && (
                                             <div className="p-3 space-y-2 border-t border-border bg-muted/10">
-                                                {chunk.items.map((item, localIdx) => {
-                                                    const index = chunk.startIndex + localIdx;
+                                                {chunk.entries.map(({ item, index }) => {
                                                     const issue = item.issue;
                                                     const series = issue?.series;
+                                                    const owned = isOwned(item);
                                                     const coverUrl = activeList.coverUrl || issue?.coverUrl || (series?.folderPath ? `/api/library/cover?path=${encodeURIComponent(series.folderPath)}` : '/api/library/cover?path=missing');
 
                                                 return (
-                                                    <div key={item.id} className="flex items-center gap-4 p-3 bg-background border border-border rounded-xl shadow-sm hover:border-primary/50 transition-all">
+                                                    <div key={item.id} data-testid="reading-list-row" className="flex items-center gap-4 p-3 bg-background border border-border rounded-xl shadow-sm hover:border-primary/50 transition-all">
                                                         <span className="w-8 text-center font-mono text-xs font-bold text-muted-foreground">{index + 1}</span>
                                                         <div className="w-10 h-14 shrink-0 rounded overflow-hidden bg-muted border border-border">
-                                                            <img src={coverUrl} className="w-full h-full object-cover" alt="" />
+                                                            <img src={coverUrl} className={`w-full h-full object-cover ${item.progress?.isRead ? 'opacity-60' : ''}`} alt="" />
                                                     </div>
                                                     <div className="flex-1 min-w-0">
                                                         {issue ? (
                                                             <>
-                                                                <h4 className="font-bold text-sm truncate text-foreground">{series.name}</h4>
+                                                                <h4 className={`font-bold text-sm truncate ${item.progress?.isRead ? 'text-muted-foreground' : 'text-foreground'}`}>{issue.series.name}</h4>
                                                                 <p className="text-xs text-muted-foreground truncate">Issue #{issue.number} • {issue.name || "Untitled"}</p>
+                                                                {!owned && <p className="text-[10px] font-bold uppercase tracking-wider text-orange-500 dark:text-orange-400 mt-1">Not in your library yet</p>}
                                                             </>
                                                         ) : (
                                                                 <h4 className="font-bold text-sm truncate text-muted-foreground">{item.title} (Missing File)</h4>
                                                         )}
                                                     </div>
                                                     <div className="flex items-center gap-2 pr-2 shrink-0">
+                                                        <ReadingState progress={item.progress} />
                                                         {!issue && (
                                                             <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary" title="Re-check this item against the library" onClick={() => handleRefreshItem(item.id)} disabled={refreshingItemIds.has(item.id)}>
                                                                 {refreshingItemIds.has(item.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                             </Button>
                                                         )}
                                                         {issue && isAdmin && (
-                                                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary hidden sm:flex" title={`Resync metadata for ${series.name}`} onClick={() => handleResyncSeries(series)} disabled={resyncingSeriesIds.has(series.id)}>
-                                                                {resyncingSeriesIds.has(series.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                                                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary hidden sm:flex" title={`Resync metadata for ${issue.series.name}`} onClick={() => handleResyncSeries(issue.series)} disabled={resyncingSeriesIds.has(issue.series.id)}>
+                                                                {resyncingSeriesIds.has(issue.series.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                             </Button>
                                                         )}
-                                                        {issue && (
+                                                        {isOwned(item) && (
                                                             <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
-                                                                <Link href={`/reader?path=${encodeURIComponent(issue.filePath)}&series=${encodeURIComponent(series.folderPath)}`}>
+                                                                <Link href={readerHref(item.issue)}>
                                                                     <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
                                                                 </Link>
                                                             </Button>
@@ -1012,31 +1105,35 @@ function ReadingListsContent() {
                                                           </div>
                                                           
                                                           <div className="w-12 h-16 shrink-0 rounded overflow-hidden bg-muted border border-border flex items-center justify-center">
-                                                              <img src={coverUrl} className="w-full h-full object-cover" alt="" />
+                                                              <img src={coverUrl} className={`w-full h-full object-cover ${item.progress?.isRead ? 'opacity-60' : ''}`} alt="" />
                                                           </div>
 
                                                           <div className="flex-1 min-w-0">
                                                               <div className="flex items-center gap-2 mb-1">
                                                                   <Badge variant="secondary" className="shrink-0 text-[10px] font-mono h-5 bg-primary/20 text-primary border-primary/30">Part {index + 1}</Badge>
-                                                                  <h4 className="font-bold text-sm truncate text-foreground">{series.name}</h4>
+                                                                  <h4 className={`font-bold text-sm truncate ${item.progress?.isRead ? 'text-muted-foreground' : 'text-foreground'}`}>{series.name}</h4>
                                                               </div>
                                                               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                                                                   <span className="font-bold text-foreground shrink-0">Issue #{issue.number}</span>
                                                                   <span className="truncate hidden sm:inline">• {issue.name || "Untitled Issue"}</span>
                                                               </div>
+                                                              {!isOwned(item) && <div className="text-[10px] font-bold uppercase tracking-wider text-orange-500 dark:text-orange-400 mt-1">Not in your library yet</div>}
                                                           </div>
 
                                                           <div className="flex items-center gap-2 shrink-0 pr-2">
+                                                              <ReadingState progress={item.progress} />
                                                               {isAdmin && (
                                                                   <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary hidden sm:flex" title={`Resync metadata for ${series.name}`} onClick={() => handleResyncSeries(series)} disabled={resyncingSeriesIds.has(series.id)}>
                                                                       {resyncingSeriesIds.has(series.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                                   </Button>
                                                               )}
-                                                              <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
-                                                                  <Link href={`/reader?path=${encodeURIComponent(issue.filePath)}&series=${encodeURIComponent(series.folderPath)}`}>
-                                                                      <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
-                                                                  </Link>
-                                                              </Button>
+                                                              {isOwned(item) && (
+                                                                  <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
+                                                                      <Link href={readerHref(issue)}>
+                                                                          <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
+                                                                      </Link>
+                                                                  </Button>
+                                                              )}
                                                               {(isAdmin || activeList.userId === session?.user?.id) && (
                                                                   <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 hidden sm:flex" onClick={() => handleRemoveItem(item.id)}>
                                                                       <Minus className="w-4 h-4" />
@@ -1054,6 +1151,10 @@ function ReadingListsContent() {
                           </Droppable>
                       </DragDropContext>
                   )}
+              </div>
+          ) : activeListId ? (
+              <div className="flex justify-center py-32">
+                  <Loader2 className="w-8 h-8 animate-spin text-primary" />
               </div>
           ) : (
               <div className="hidden lg:flex flex-col items-center justify-center py-32 text-center border-2 border-dashed rounded-xl border-border bg-background">
