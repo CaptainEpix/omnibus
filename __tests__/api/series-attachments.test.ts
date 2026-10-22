@@ -252,6 +252,10 @@ describe('API: attachments — absorbing a standalone series (PUT)', () => {
         expect(data).toEqual({ success: true, moved: 1, skeletonsReplaced: 1, removedSeries: true });
         // The file-less skeleton is the disposable one.
         expect(prisma.issue.delete).toHaveBeenCalledWith({ where: { id: 'skeleton' } });
+        // Its reading-list entries move to the book replacing it first; the delete would cascade them away.
+        expect(prisma.readingListItem.updateMany).toHaveBeenCalledWith({ where: { issueId: 'skeleton' }, data: { issueId: 'owned' } });
+        expect((prisma.readingListItem.updateMany as any).mock.invocationCallOrder[0])
+            .toBeLessThan((prisma.issue.delete as any).mock.invocationCallOrder[0]);
         // The row that owns the file survives and joins the lane — progress and curation intact.
         expect(prisma.issue.update).toHaveBeenCalledWith({
             where: { id: 'owned' },
@@ -402,6 +406,24 @@ describe('API: attachments — keeping a volume as its own series (#239)', () =>
 
         expect(data.existingSeries).toBeNull();
         expect(data.retainedSeries).toEqual(child);
+    });
+
+    it('keeps offering the move for an attachment that was never kept, even though its series exists', async () => {
+        (prisma.series.findUnique as any).mockResolvedValue({ id: 's_parent', name: 'Absolute Batman', metadataSource: 'COMICVINE', metadataId: '160294' });
+        (prisma.attachedVolume.upsert as any).mockResolvedValue(parentAtt);
+        (prisma.series.findFirst as any).mockResolvedValue({ ...child, _count: { issues: 2 } });
+        (prisma.issue.findMany as any).mockResolvedValue([]);
+        (omnibusQueue.add as any).mockResolvedValue({});
+        (engineFetchLong as any).mockResolvedValue(engineOk({ attachment_id: 'att2', total: 2, claimed: 0, created: 0, updated: 0, unclaimed: 0 }));
+
+        const posted = await (await POST(createReq({ seriesId: 's_parent', volumeId: '167340', kind: 'COLLECTED' }))).json();
+        expect(posted.existingSeries).toEqual({ ...child, issueCount: 2 });
+        expect(posted.retainedSeries).toBeNull();
+
+        (prisma.attachedVolume.findMany as any).mockResolvedValue([{ ...parentAtt, name: 'Absolute Batman', startYear: 2025, issueCount: 0, lastSyncedAt: null }]);
+        (prisma.issue.groupBy as any).mockResolvedValue([]);
+        const listed = await (await GET(getReq('http://localhost/api/library/series/attachments?seriesId=s_parent'))).json();
+        expect(listed.attachments[0]).toMatchObject({ retained: false, retainedSeries: null });
     });
 
     it('lists a kept attachment with the series it lives in', async () => {

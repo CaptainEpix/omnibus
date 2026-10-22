@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { GET } from '@/app/api/library/series/route';
 import { prisma } from '@/lib/db';
 import fs from 'fs-extra';
+import { canAccessPath } from '@/lib/library-access';
 import { getReq } from '../helpers/request';
 
 vi.mock('next-auth/next', () => ({ getServerSession: vi.fn().mockResolvedValue(null) }));
@@ -43,8 +44,8 @@ const parentRow = (id: string, n: string, meta: string, file: string | null, att
     id, number: n, isAnnual: false, metadataId: meta, filePath: file, name: null,
     attachedVolumeId: attached ? 'att' : null, attachedVolume: attached ? { kind: 'COLLECTED', name: 'Absolute Batman' } : null,
 });
-const childBook = (id: string, n: string, meta: string, file: string | null, name: string) => ({
-    id, seriesId: 's_child', number: n, isAnnual: false, metadataId: meta, filePath: file, name,
+const childBook = (id: string, n: string, meta: string, file: string | null, name: string, attachedVolumeId: string | null = null) => ({
+    id, seriesId: 's_child', number: n, isAnnual: false, metadataId: meta, filePath: file, name, attachedVolumeId,
     coverUrl: null, releaseDate: null, coversIssues: null, writers: null, artists: null, characters: null, genres: null, storyArcs: null,
 });
 
@@ -54,6 +55,7 @@ describe('#239 the parent shelf lists a kept collection\'s books', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        (canAccessPath as any).mockImplementation(() => true);
         (prisma.library.findMany as any).mockResolvedValue([{ id: 'lib1', path: '/comics' }]);
         (prisma.series.findFirst as any).mockResolvedValue({ id: 's1', name: 'Absolute Batman', year: 2024, folderPath: PARENT, metadataId: '160294', metadataSource: 'COMICVINE' });
         (prisma.series.findMany as any).mockImplementation(async ({ where }: any) =>
@@ -61,7 +63,9 @@ describe('#239 the parent shelf lists a kept collection\'s books', () => {
         (prisma.issue.deleteMany as any).mockResolvedValue({ count: 0 });
         (prisma.attachedVolume.findMany as any).mockImplementation(async ({ where }: any) => (where?.retained ? [kept] : []));
         (prisma.issue.findMany as any).mockImplementation(async ({ where }: any) =>
-            where.seriesId === 's_child' ? childBooks : parentRows);
+            where.seriesId === 's_child'
+                ? childBooks.filter(b => where.attachedVolumeId !== null || !b.attachedVolumeId)
+                : parentRows);
         (fs.promises.access as any).mockImplementation(async (p: string) => {
             if (p.includes('MISSING')) throw new Error('ENOENT');
         });
@@ -104,6 +108,29 @@ describe('#239 the parent shelf lists a kept collection\'s books', () => {
 
         expect(body.collectedEditions.map((b: any) => b.id).sort()).toEqual(['c1', 'lane_owned']);
         expect(body.missingCollectedEditions).toEqual([]);
+    });
+
+    it("leaves out books of the child's own attachments, which Standardize names by their lane", async () => {
+        childBooks = [
+            childBook('c1', '1', '9200001', `${CHILD.folderPath}/Absolute Batman Vol. 001 (2025).cbz`, 'The Zoo'),
+            childBook('c_ann', '1', '9300001', `${CHILD.folderPath}/Absolute Batman Annual 001 (2025).cbz`, 'Annual', 'child_att'),
+        ];
+        const body = await load();
+        expect(body.collectedEditions.map((b: any) => b.id)).toEqual(['c1']);
+        expect(body.missingCollectedEditions).toEqual([]);
+    });
+
+    it("lists none of the child's books when the viewer can't open the child's library", async () => {
+        (canAccessPath as any).mockImplementation((_paths: any, p: string) => p !== CHILD.folderPath);
+        childBooks = [
+            childBook('c1', '1', '9200001', `${CHILD.folderPath}/Absolute Batman Vol. 001 (2025).cbz`, 'The Zoo'),
+            childBook('c2', '2', '9200002', null, 'Abomination'),
+        ];
+        const body = await load();
+        expect(body.collectedEditions).toEqual([]);
+        expect(body.missingCollectedEditions).toEqual([]);
+        expect(body.downloadedIssues.map((i: any) => i.id)).toEqual(['p1']);
+        expect(prisma.issue.findMany).not.toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ seriesId: 's_child' }) }));
     });
 
     it('lists nothing extra for an attachment that is not kept', async () => {

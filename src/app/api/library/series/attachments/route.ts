@@ -367,6 +367,9 @@ export async function PUT(request: Request) {
                     ? laneRows.find(r => r.id !== issue.id && r.metadataId === issue.metadataId && !r.filePath)
                     : undefined;
                 if (twin) {
+                    // Its reading-list entries follow the book that replaces it (same provider issue);
+                    // the delete would otherwise cascade them away.
+                    await tx.readingListItem.updateMany({ where: { issueId: twin.id }, data: { issueId: issue.id } });
                     await tx.issue.delete({ where: { id: twin.id } });
                     skeletonsReplaced++;
                 }

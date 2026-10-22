@@ -4543,6 +4543,24 @@ mod tests {
         .fetch_one(&db.pool).await.unwrap();
         assert_eq!(complete, 1, "the rebuilt series is excluded from the scheduled provider sweep");
 
+        // -- 7. #239, the other restore path (5J): the series is ALREADY in the database when its
+        //       series.json arrives — only the attachments are gone, and it holds an unattached
+        //       annual file. The kept choice must come back here too.
+        sqlx::query(r#"DELETE FROM "AttachedVolume""#).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"UPDATE "Issue" SET "isAnnual" = 1, "attachedVolumeId" = NULL"#).execute(&db.pool).await.unwrap();
+        scan_library(db.clone(), base.to_string_lossy().replace('\\', "/"), "rt_lib".to_string(), None)
+            .await
+            .expect("rescan with the series still in place");
+        let restored: Vec<(String, i64)> = sqlx::query(
+            r#"SELECT "volumeId", CAST(retained AS INTEGER) AS retained FROM "AttachedVolume" WHERE "seriesId" = $1 ORDER BY "volumeId""#,
+        )
+        .bind(&series_id)
+        .fetch_all(&db.pool).await.unwrap()
+        .iter()
+        .map(|r| (r.get("volumeId"), r.get("retained")))
+        .collect();
+        assert_eq!(restored, vec![("7001".to_string(), 1), ("7002".to_string(), 0)]);
+
         drop(db);
         let _ = std::fs::remove_dir_all(&base);
     }

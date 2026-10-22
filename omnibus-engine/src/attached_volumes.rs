@@ -161,9 +161,10 @@ pub(crate) async fn retaining_kinds(db: &Db, series_id: &str) -> anyhow::Result<
 ///    guard (metadata.rs `cross_series_candidates`) the child's own metadata sync could take the
 ///    parent's skeleton for a book it lacked, and the row kept the parent's attachment id: the
 ///    absorb then found it as its own "twin" (delete, then update → "Record to update not found"),
-///    and a Refresh "updated" it in the child instead of recreating the parent's skeleton. No
-///    legitimate row is ever in that state — an absorb moves the row and its link together — and in
-///    the series it now lives in it is simply that series' own issue.
+///    and a Refresh "updated" it in the child instead of recreating the parent's skeleton. Moving
+///    issues to another series from the series page (`issue/move`) can leave the same shape: it
+///    changes `seriesId` and keeps the link. Either way the row now belongs to the series it sits
+///    in, where it is simply that series' own issue, so unbinding is the right result.
 /// 2. A `retained` flag whose child no longer exists (deleted, or rematched to another volume) is
 ///    cleared, so the attachment is an ordinary lane again and a returning volume is asked about
 ///    afresh — the same outcome the earlier pointer design gave with `onDelete: SetNull`.
@@ -1331,6 +1332,28 @@ mod tests {
         sqlx::query(r#"UPDATE "AttachedVolume" SET retained = false WHERE id = 'att'"#).execute(&db.pool).await.unwrap();
         let summary = apply_lane(&db, &lane(false), &volume, &issues).await.unwrap();
         assert_eq!((summary.claimed, summary.updated), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_retained_annual_lane_adopts_no_row_by_id() {
+        let db = fixture_prisma("apply_retained_annual").await;
+        seed_absolute_batman(&db, true).await;
+        sqlx::query(r#"UPDATE "AttachedVolume" SET kind = 'ANNUAL' WHERE id = 'att'"#).execute(&db.pool).await.unwrap();
+        // An unbound annual row in the parent already carrying the provider issue's id: the shape
+        // id-adoption takes. Claiming is off so only the id-adoption pass can reach it.
+        add_issue(&db, "annual_row", "parent", "2", "9200002", Some("/c/DC Comics/Absolute Batman (2024)/Absolute Batman Annual 002.cbz"), None).await;
+        sqlx::query(r#"UPDATE "Issue" SET "isAnnual" = true WHERE id = 'annual_row'"#).execute(&db.pool).await.unwrap();
+        let annual_lane = |retained| Lane { kind: "ANNUAL", claim: false, ..lane(retained) };
+
+        let summary = apply_lane(&db, &annual_lane(true), &LaneVolume::default(), &[lane_issue("9200002", "2")]).await.unwrap();
+        assert_eq!((summary.created, summary.updated), (0, 0));
+        let bound: Option<String> = sqlx::query_scalar(r#"SELECT "attachedVolumeId" FROM "Issue" WHERE id = 'annual_row'"#).fetch_one(&db.pool).await.unwrap();
+        assert!(bound.is_none(), "a retained lane reaches for nothing");
+
+        // The same lane NOT retained adopts it by id.
+        apply_lane(&db, &annual_lane(false), &LaneVolume::default(), &[lane_issue("9200002", "2")]).await.unwrap();
+        let bound: Option<String> = sqlx::query_scalar(r#"SELECT "attachedVolumeId" FROM "Issue" WHERE id = 'annual_row'"#).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(bound.as_deref(), Some("att"));
     }
 
     #[tokio::test]

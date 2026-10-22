@@ -409,7 +409,11 @@ export async function GET(request: Request) {
             const laneRows = existingIssues.filter(i => i.attachedVolumeId === attachment.id && i.metadataId);
             const parentOwns = new Set(laneRows.filter(i => i.filePath && existingPaths.has(i.filePath)).map(i => i.metadataId));
             for (const child of await retainedChildren(attachment)) {
-                const books = await prisma.issue.findMany({ where: { seriesId: child.id, isAnnual: false } });
+                // The child can live in a library this viewer can't open; its books stay off the shelf then.
+                if (!canAccessPath(accessiblePaths, child.folderPath)) continue;
+                // Only the child's own books: rows of an attachment of the child's are named by that lane,
+                // not as collected editions, so Standardize and the shelf agree.
+                const books = await prisma.issue.findMany({ where: { seriesId: child.id, isAnnual: false, attachedVolumeId: null } });
                 const onDisk = new Set<string>();
                 await Promise.all(books.filter(b => b.filePath).map(async b => {
                     try { await fs.promises.access(b.filePath!); onDisk.add(b.id); } catch { /* gone */ }
